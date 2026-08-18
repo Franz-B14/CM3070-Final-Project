@@ -16,6 +16,7 @@ from collections import deque
 from datetime import datetime
 
 from cap_emit import CapEmitter
+import corroborate
 
 PORT = "/dev/ttyACM0"
 BAUD = 115200
@@ -80,6 +81,7 @@ nodes = {
 
 last_command = ("OPEN", "OFF", "NONE")
 latest_cap = None
+current_corroboration = {}
 
 
 def now_text():
@@ -220,6 +222,22 @@ def refresh_liveness(current_time):
                   f"{HEARTBEAT_TIMEOUT_S:.0f} seconds")
 
 
+def hazards_in(fields):
+    """Return the hazards reported by one verified SenseNode message."""
+    hazards = set()
+
+    if fields.get("status") == "FLOOD":
+        hazards.add("FLOOD")
+
+    if fields.get("quake") == "QUAKE":
+        hazards.add("QUAKE")
+
+    if fields.get("fire") == "FIRE":
+        hazards.add("FIRE")
+
+    return hazards
+
+
 def get_active_hazards():
     """Return hazards currently reported by live nodes."""
     hazards = set()
@@ -242,18 +260,24 @@ def get_active_hazards():
     return hazards
 
 
-def responder_state():
-    """Convert the current live hazards into a responder command."""
-    hazards = get_active_hazards()
-
-    if not hazards:
+def responder_state(snapshot):
+    """Convert the corroborated hazard picture into a responder command."""
+    if not snapshot:
         return ("OPEN", "OFF", "NONE")
 
-    barrier = "CLOSED" if "FLOOD" in hazards else "OPEN"
+    barrier = (
+        "CLOSED"
+        if "FLOOD" in snapshot
+        else "OPEN"
+    )
     alarm = "CRITICAL"
 
     priority = ["FLOOD", "QUAKE", "FIRE"]
-    active = [hazard for hazard in priority if hazard in hazards]
+    active = [
+        hazard
+        for hazard in priority
+        if hazard in snapshot
+    ]
 
     if len(active) > 1:
         hazard = "MULTI"
@@ -349,12 +373,32 @@ def active_hazard_map():
     }
 
 
+def cap_hazard_map(snapshot):
+    """
+    Convert the R1 snapshot to the node-list format used by the first CAP
+    emitter. Held nodes are included here so their hazard is not lost.
+
+    A later CAP revision will consume the snapshot directly so held nodes do
+    not incorrectly contribute to certainty.
+    """
+    return {
+        hazard: sorted(
+            set(details.get("observing", []))
+            | set(details.get("held", []))
+        )
+        for hazard, details in snapshot.items()
+    }
+
+
 def build_state():
     """Build the JSON object used by the dashboard."""
-    hazards = sorted(get_active_hazards())
-    live_nodes = any(nodes[node_id]["live"] for node_id in NODE_ORDER)
+    hazards = sorted(current_corroboration)
+    live_nodes = any(
+        nodes[node_id]["live"]
+        for node_id in NODE_ORDER
+    )
 
-    if not live_nodes:
+    if not live_nodes and not hazards:
         status = "--"
         hazard = "NONE"
     elif hazards:
@@ -372,6 +416,7 @@ def build_state():
         "barrier_commanded": last_command[0],
         "barrier_confirmed": None,
         "cap": latest_cap,
+        "corroboration": current_corroboration,
         "updated": now_text(),
         "node_order": NODE_ORDER,
         "nodes": nodes,
@@ -414,7 +459,7 @@ def print_node_summary(node_id):
 
 
 def main():
-    global last_command, latest_cap
+    global last_command, latest_cap, current_corroboration
 
     last_command_time = 0.0
     contact_warned = False
@@ -433,6 +478,7 @@ def main():
     print("Press Ctrl+C to stop\n")
 
     emitter = CapEmitter()
+    corr = corroborate.Corroborator()
 
     # Start by telling the responder the expected safe state.
     send_command(ser, *last_command)
@@ -523,6 +569,14 @@ def main():
                                 current_time
                             )
 
+                            # Only authenticated, non-replayed messages reach
+                            # the corroborator.
+                            corr.observe(
+                                node_id,
+                                hazards_in(fields),
+                                current_time
+                            )
+
                             print_node_summary(node_id)
 
             refresh_liveness(current_time)
@@ -533,9 +587,19 @@ def main():
                 if nodes[node_id]["live"]
             ]
 
-            # CAP emission uses the current live hazard map. This first version
-            # predates the later corroboration/hold logic.
-            hazard_map = active_hazard_map()
+            # One corroboration snapshot is used by the responder, CAP bridge
+            # and dashboard so they all see the same hazard picture.
+            current_corroboration = corr.snapshot(
+                live_nodes,
+                current_time
+            )
+            corr.prune(current_time)
+
+            # The C3 emitter still expects {hazard: [nodes]}, so bridge the
+            # richer R1 snapshot back to that format for now.
+            hazard_map = cap_hazard_map(
+                current_corroboration
+            )
 
             emitted = emitter.step(
                 bool(live_nodes),
@@ -561,7 +625,9 @@ def main():
             else:
                 latest_cap = emitter.latest
 
-            desired_command = responder_state()
+            desired_command = responder_state(
+                current_corroboration
+            )
 
             # Losing every node is not evidence that an earlier hazard cleared.
             # Keep the previous responder state until at least one node returns.
