@@ -306,8 +306,23 @@ PAGE = """<!doctype html>
     .responder {
       background: white;
       border: 1px solid #ccc;
+      border-left: 8px solid #777;
       margin-top: 16px;
       padding: 14px;
+    }
+
+    .responder.off {
+      border-left-color: #16865a;
+    }
+
+    .responder.warn {
+      border-left-color: #b26a00;
+      background: #fffaf0;
+    }
+
+    .responder.critical {
+      border-left-color: #c0392b;
+      background: #fff5f4;
     }
 
     .responder h2 {
@@ -342,9 +357,20 @@ PAGE = """<!doctype html>
       color: #c0392b;
     }
 
+    .alarm-warn {
+      color: #b26a00;
+    }
+
     .barrier-open,
     .alarm-off {
       color: #16865a;
+    }
+
+    .responder-note {
+      margin-top: 10px;
+      color: #666;
+      font-size: 12px;
+      line-height: 1.5;
     }
 
     .not-confirmed {
@@ -458,7 +484,7 @@ PAGE = """<!doctype html>
     </div>
   </div>
 
-  <div class="responder">
+  <div id="responderPanel" class="responder">
     <h2>Responder state</h2>
     <div class="responder-grid">
       <div class="responder-box">
@@ -480,6 +506,11 @@ PAGE = """<!doctype html>
         <span>Responder commands sent</span>
         <strong id="commandsSent">0</strong>
       </div>
+    </div>
+
+    <div class="responder-note">
+      WARN indicates a single-node or held hazard. CRITICAL indicates that
+      two or more live SenseNodes currently corroborate at least one hazard.
     </div>
   </div>
 
@@ -648,9 +679,23 @@ function updateResponder(state) {
   }
 
   var alarmElement = document.getElementById("alarmState");
+  var responderPanel = document.getElementById("responderPanel");
+
   alarmElement.textContent = alarm;
-  alarmElement.className =
-    alarm === "OFF" ? "alarm-off" : "alarm-critical";
+  responderPanel.className = "responder";
+
+  if (alarm === "CRITICAL") {
+    alarmElement.className = "alarm-critical";
+    responderPanel.classList.add("critical");
+  } else if (alarm === "WARN") {
+    alarmElement.className = "alarm-warn";
+    responderPanel.classList.add("warn");
+  } else if (alarm === "OFF") {
+    alarmElement.className = "alarm-off";
+    responderPanel.classList.add("off");
+  } else {
+    alarmElement.className = "";
+  }
 
   var stats = state.stats || {};
   document.getElementById("commandsSent").textContent =
