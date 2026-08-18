@@ -1,16 +1,16 @@
 /*
   sketch_C_responder.ino
-  Stage C4 - community beacon role
+  Stage C5 - stale gateway fail-safe
 
   Receives gateway command frames over LoRa and verifies:
     - sender is the gateway
     - HMAC-SHA256 signature
     - monotonically increasing sequence number
 
-  This revision adds a second responder role for a public warning beacon.
-  The same authenticated command frame is used by both roles. The actuator
-  keeps its engineering display and servo behaviour; the beacon shows simple
-  public guidance and uses an LED/sounder when an alarm is active.
+  This revision tracks the last valid authenticated gateway command.
+  Silence is not treated as an all-clear: after the gateway link becomes
+  stale, the actuator holds its last barrier state and the public beacon shows
+  NO SIGNAL. An alarm already in progress continues through contact loss.
 */
 
 #include <SPI.h>
@@ -42,6 +42,10 @@
 #define SERVO_ANGLE_OPEN    0
 #define SERVO_ANGLE_CLOSED 90
 #define SERVO_TRAVEL_MS   700
+
+// Gateway normally repeats its responder state every 30 seconds. Allow more
+// than three missed heartbeats before declaring the downlink stale.
+#define STALE_TIMEOUT_MS 100000UL
 
 Servo barrierServo;
 Preferences preferences;
@@ -82,6 +86,10 @@ Adafruit_SSD1306 display(
 static uint32_t lastSeqGw = 0;
 static uint32_t acceptCount = 0;
 static uint32_t rejectCount = 0;
+
+// Only a fully authenticated, non-replayed gateway frame refreshes contact.
+static uint32_t lastValidMs = 0;
+static bool everHeardGateway = false;
 
 static char lastResult[24] = "waiting";
 static char lastReason[24] = "";
@@ -270,6 +278,18 @@ void recordReject(const char *reason) {
 }
 
 
+bool isGatewayStale() {
+  if (!everHeardGateway) {
+    return true;
+  }
+
+  return (
+    millis() - lastValidMs
+    > STALE_TIMEOUT_MS
+  );
+}
+
+
 // ---------------------------------------------------------------------------
 // Community beacon
 // ---------------------------------------------------------------------------
@@ -286,42 +306,81 @@ void serviceBeaconSignal() {
     return;
   }
 
-  if (!alarmActive()) {
-    signalOn = false;
+  bool stale =
+    isGatewayStale();
+
+  // An already active alarm keeps sounding even if the gateway later goes
+  // silent. Silence cannot clear a warning.
+  if (alarmActive()) {
+    uint32_t interval =
+      signalOn
+        ? SIGNAL_ON_MS
+        : SIGNAL_OFF_MS;
+
+    if (
+      millis() - lastSignalChange
+      < interval
+    ) {
+      return;
+    }
+
+    lastSignalChange = millis();
+    signalOn = !signalOn;
+
     digitalWrite(
       LED_PIN,
-      LOW
+      signalOn ? HIGH : LOW
     );
+
+    digitalWrite(
+      BUZZER_PIN,
+      signalOn ? HIGH : LOW
+    );
+
+    return;
+  }
+
+  // With no active alarm, stale contact is shown by a quiet LED pulse. The
+  // sounder stays off because the hazard state itself is unknown.
+  if (stale) {
+    uint32_t interval =
+      signalOn
+        ? 120
+        : 1880;
+
+    if (
+      millis() - lastSignalChange
+      < interval
+    ) {
+      return;
+    }
+
+    lastSignalChange = millis();
+    signalOn = !signalOn;
+
+    digitalWrite(
+      LED_PIN,
+      signalOn ? HIGH : LOW
+    );
+
     digitalWrite(
       BUZZER_PIN,
       LOW
     );
+
     return;
   }
 
-  uint32_t interval =
-    signalOn
-      ? SIGNAL_ON_MS
-      : SIGNAL_OFF_MS;
-
-  if (
-    millis() - lastSignalChange
-    < interval
-  ) {
-    return;
-  }
-
-  lastSignalChange = millis();
-  signalOn = !signalOn;
+  signalOn = false;
 
   digitalWrite(
     LED_PIN,
-    signalOn ? HIGH : LOW
+    LOW
   );
 
   digitalWrite(
     BUZZER_PIN,
-    signalOn ? HIGH : LOW
+    LOW
   );
 }
 
@@ -400,6 +459,17 @@ void drawBeacon() {
 
     display.setCursor(0, 50);
     display.println(line2);
+  } else if (isGatewayStale()) {
+    display.setTextSize(2);
+    display.setCursor(0, 18);
+    display.println("NO SIGNAL");
+
+    display.setTextSize(1);
+    display.setCursor(0, 42);
+    display.println("Status unknown.");
+
+    display.setCursor(0, 54);
+    display.println("Seek local guidance.");
   } else {
     display.setTextSize(2);
     display.setCursor(0, 18);
@@ -550,6 +620,10 @@ void handleFrame(char *frame) {
 
   lastSeqGw = sequence;
 
+  // Only a valid, fresh command proves that the gateway is still present.
+  lastValidMs = millis();
+  everHeardGateway = true;
+
   char newBarrier[8] = "";
 
   getField(
@@ -630,7 +704,14 @@ void drawActuator() {
 
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.println("RESPONDER RX");
+  display.print("ACTUATOR ");
+  display.print(ROLE);
+
+  if (isGatewayStale()) {
+    display.print(" STALE");
+  }
+
+  display.println();
 
   display.setTextSize(1);
   display.setCursor(0, 15);
@@ -805,4 +886,17 @@ void loop() {
   }
 
   serviceBeaconSignal();
+
+  // A timeout happens without receiving a packet, so refresh the display when
+  // the stale/not-stale state changes.
+  static bool previousStale =
+    isGatewayStale();
+
+  bool staleNow =
+    isGatewayStale();
+
+  if (staleNow != previousStale) {
+    previousStale = staleNow;
+    drawStatus();
+  }
 }
