@@ -22,6 +22,7 @@ DEFAULT_STATE = {
     "barrier_commanded": "OPEN",
     "barrier_confirmed": None,
     "cap": None,
+    "corroboration": {},
     "updated": "-",
     "node_order": ["n1", "n2", "n3"],
     "nodes": {
@@ -162,6 +163,90 @@ PAGE = """<!doctype html>
       display: flex;
       gap: 30px;
       flex-wrap: wrap;
+    }
+
+    .corr-panel {
+      background: white;
+      border: 1px solid #ccc;
+      margin-top: 16px;
+      padding: 14px;
+    }
+
+    .corr-panel h2 {
+      margin: 0 0 10px 0;
+      font-size: 18px;
+    }
+
+    .corr-note {
+      color: #666;
+      font-size: 13px;
+      margin-bottom: 10px;
+    }
+
+    .corr-row {
+      border: 1px solid #ddd;
+      margin-top: 8px;
+      padding: 10px;
+    }
+
+    .corr-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .corr-hazard {
+      font-weight: bold;
+      font-size: 16px;
+    }
+
+    .certainty {
+      border-radius: 3px;
+      padding: 3px 8px;
+      font-size: 12px;
+      font-weight: bold;
+    }
+
+    .certainty-observed {
+      background: #e7f5ef;
+      color: #16865a;
+    }
+
+    .certainty-likely {
+      background: #fff3d6;
+      color: #8a5a00;
+    }
+
+    .certainty-unknown {
+      background: #f4e8e6;
+      color: #a93226;
+    }
+
+    .corr-detail {
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    .corr-detail strong {
+      display: inline-block;
+      min-width: 90px;
+    }
+
+    .node-chip {
+      display: inline-block;
+      border: 1px solid #bbb;
+      border-radius: 3px;
+      margin-right: 5px;
+      padding: 1px 6px;
+      font-family: monospace;
+      font-size: 12px;
+    }
+
+    .held-chip {
+      border-style: dashed;
+      color: #8a5a00;
     }
 
     .cap-panel {
@@ -330,6 +415,15 @@ PAGE = """<!doctype html>
 
   <div id="nodes" class="nodes"></div>
 
+  <div class="corr-panel">
+    <h2>Hazard corroboration</h2>
+    <div class="corr-note">
+      Certainty is based on how many live SenseNodes are currently reporting
+      the same hazard. Recently lost reporting nodes are shown as held.
+    </div>
+    <div id="corrContent">No active hazards to corroborate.</div>
+  </div>
+
   <div id="capPanel" class="cap-panel">
     <h2>CAP alert</h2>
     <div id="capEmpty">No CAP alert has been emitted.</div>
@@ -423,6 +517,76 @@ function batteryClass(band) {
   return "";
 }
 
+function nodeChips(nodes, held) {
+  if (!nodes || nodes.length === 0) {
+    return "none";
+  }
+
+  return nodes.map(function(nodeId) {
+    var cls = held ? "node-chip held-chip" : "node-chip";
+    return "<span class='" + cls + "'>" +
+      valueOrDash(nodeId).toUpperCase() +
+      "</span>";
+  }).join("");
+}
+
+function certaintyClass(certainty) {
+  if (certainty === "Observed") {
+    return "certainty-observed";
+  }
+  if (certainty === "Likely") {
+    return "certainty-likely";
+  }
+  return "certainty-unknown";
+}
+
+function updateCorroboration(state) {
+  var snapshot = state.corroboration || {};
+  var box = document.getElementById("corrContent");
+  var order = ["FLOOD", "QUAKE", "FIRE"];
+  var active = order.filter(function(hazard) {
+    return snapshot[hazard];
+  });
+
+  if (active.length === 0) {
+    box.innerHTML = "No active hazards to corroborate.";
+    return;
+  }
+
+  var html = "";
+
+  active.forEach(function(hazard) {
+    var item = snapshot[hazard] || {};
+    var observing = item.observing || [];
+    var held = item.held || [];
+    var certainty = item.certainty || "Unknown";
+    var age = (
+      item.age === null ||
+      item.age === undefined
+    ) ? "-" : item.age + " s";
+
+    html += "<div class='corr-row'>";
+    html += "<div class='corr-head'>";
+    html += "<span class='corr-hazard'>" + hazard + "</span>";
+    html += "<span class='certainty " +
+      certaintyClass(certainty) + "'>" +
+      certainty + "</span>";
+    html += "</div>";
+
+    html += "<div class='corr-detail'>";
+    html += "<div><strong>Observing</strong>" +
+      nodeChips(observing, false) + "</div>";
+    html += "<div><strong>Held</strong>" +
+      nodeChips(held, true) + "</div>";
+    html += "<div><strong>Last report</strong>" +
+      valueOrDash(age) + "</div>";
+    html += "</div>";
+    html += "</div>";
+  });
+
+  box.innerHTML = html;
+}
+
 function updateCap(state) {
   var cap = state.cap;
   var panel = document.getElementById("capPanel");
@@ -504,6 +668,7 @@ function updateDashboard(state) {
     valueOrDash(state.hazard);
 
   updateResponder(state);
+  updateCorroboration(state);
   updateCap(state);
 
   var system = document.getElementById("system");
