@@ -3,8 +3,8 @@
  *
  * Reads the environmental sensors and checks for a possible flood.
  * Sends the current readings to the gateway using LoRa and uses the
- * MPU6050 readings to detect unusual ground movement. A short hold period
- * is used so that a detected event is not cleared immediately.
+ * MPU6050 readings to detect unusual ground movement. It also uses
+ * temperature and humidity to identify possible fire-weather conditions.
  */
 
 #include <Wire.h>
@@ -35,6 +35,10 @@
 #define LORA_BAND 868E6
 
 const int SOIL_WET_THRESHOLD = 1250;
+
+// Simple fire-weather thresholds based on high temperature and low humidity.
+const float FIRE_TEMP_THRESHOLD_C = 33.0;
+const float FIRE_HUMIDITY_THRESHOLD = 40.0;
 
 // Earthquake detection uses a short-term and long-term average of movement.
 const int SAMPLE_RATE_HZ = 100;
@@ -209,6 +213,11 @@ void loop() {
   bool soilWet = (soilValue < SOIL_WET_THRESHOLD);
   bool floodDetected = soilWet || buttonPressed;
 
+  // A fire-weather warning is raised only when both conditions are met.
+  bool fireDetected =
+    (temperature >= FIRE_TEMP_THRESHOLD_C) &&
+    (humidity < FIRE_HUMIDITY_THRESHOLD);
+
   Serial.print("Temperature: ");
   Serial.print(temperature, 1);
   Serial.print(" C, Humidity: ");
@@ -220,7 +229,9 @@ void loop() {
   Serial.print(", Flood: ");
   Serial.print(floodDetected ? "FLOOD" : "OK");
   Serial.print(", Quake: ");
-  Serial.println(quakeDetected ? "QUAKE" : "OK");
+  Serial.print(quakeDetected ? "QUAKE" : "OK");
+  Serial.print(", Fire: ");
+  Serial.println(fireDetected ? "FIRE" : "OK");
 
   if (displayFound) {
     display.clearDisplay();
@@ -240,6 +251,8 @@ void loop() {
     display.println(floodDetected ? "YES" : "NO");
     display.print("Quake: ");
     display.println(quakeDetected ? "YES" : "NO");
+    display.print("Fire:  ");
+    display.println(fireDetected ? "YES" : "NO");
     display.display();
   }
 
@@ -250,6 +263,7 @@ void loop() {
     payload += ",soil=" + String(soilValue);
     payload += ",flood=" + String(floodDetected ? "FLOOD" : "OK");
     payload += ",quake=" + String(quakeDetected ? "QUAKE" : "OK");
+    payload += ",fire=" + String(fireDetected ? "FIRE" : "OK");
 
     LoRa.beginPacket();
     LoRa.print(payload);
