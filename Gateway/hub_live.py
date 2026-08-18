@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-SenseNode gateway with multi-node monitoring.
+SenseNode gateway with dashboard state output.
 
-Receives signed LoRa messages from up to three SenseNodes, verifies each
-message, tracks when every node was last seen and shows basic battery status.
+Receives signed LoRa messages from up to three SenseNodes, tracks node
+liveness and battery status, and writes the latest state to a JSON file
+for the operator dashboard.
 """
 
 import hashlib
 import hmac
+import json
+import os
 import serial
 import time
+from datetime import datetime
 
 PORT = "/dev/ttyACM0"
 BAUD = 115200
+STATE_FILE = "/dev/shm/ews_state.json"
 
 NODE_KEYS = {
     "n1": b"REPLACE_WITH_NODE_SECRET_KEY",
@@ -26,6 +31,11 @@ HEARTBEAT_TIMEOUT_S = 90.0
 last_sequence = {node_id: 0 for node_id in NODE_ORDER}
 last_seen = {node_id: None for node_id in NODE_ORDER}
 
+stats = {
+    "accepted": 0,
+    "rejected": 0,
+}
+
 nodes = {
     node_id: {
         "live": False,
@@ -36,6 +46,10 @@ nodes = {
     }
     for node_id in NODE_ORDER
 }
+
+
+def now_text():
+    return datetime.now().strftime("%H:%M:%S")
 
 
 def parse_fields(payload):
@@ -114,6 +128,67 @@ def refresh_liveness(current_time):
             )
 
 
+def get_active_hazards():
+    """Return hazards currently reported by live nodes."""
+    hazards = set()
+
+    for node_id in NODE_ORDER:
+        node = nodes[node_id]
+
+        if not node["live"]:
+            continue
+
+        readings = node["readings"]
+
+        if readings.get("status") == "FLOOD":
+            hazards.add("FLOOD")
+        if readings.get("quake") == "QUAKE":
+            hazards.add("QUAKE")
+        if readings.get("fire") == "FIRE":
+            hazards.add("FIRE")
+
+    return hazards
+
+
+def build_state():
+    """Build the JSON object used by the dashboard."""
+    hazards = sorted(get_active_hazards())
+    live_nodes = any(nodes[node_id]["live"] for node_id in NODE_ORDER)
+
+    if not live_nodes:
+        status = "--"
+        hazard = "NONE"
+    elif hazards:
+        status = "ALERT"
+        hazard = ",".join(hazards)
+    else:
+        status = "OK"
+        hazard = "NONE"
+
+    return {
+        "status": status,
+        "hazard": hazard,
+        "updated": now_text(),
+        "node_order": NODE_ORDER,
+        "nodes": nodes,
+        "stats": stats,
+    }
+
+
+def write_state():
+    """Write the latest state without leaving a partly written JSON file."""
+    state = build_state()
+    temp_file = STATE_FILE + ".tmp"
+
+    try:
+        with open(temp_file, "w") as file:
+            json.dump(state, file)
+
+        os.replace(temp_file, STATE_FILE)
+    except OSError as error:
+        print("State write error:", error)
+
+
 def print_node_summary(node_id):
     """Print the latest readings for one node."""
     node = nodes[node_id]
@@ -141,7 +216,10 @@ def main():
 
     print("SenseNode gateway started")
     print("Listening for:", ", ".join(NODE_ORDER))
+    print("Dashboard state:", STATE_FILE)
     print("Press Ctrl+C to stop\n")
+
+    write_state()
 
     try:
         while True:
@@ -152,61 +230,62 @@ def main():
                 valid, reason, fields = verify_message(line)
 
                 if not valid:
+                    stats["rejected"] += 1
                     print("Rejected:", reason)
-                    refresh_liveness(current_time)
-                    continue
-
-                required = (
-                    "node", "status", "seq", "t", "h", "p",
-                    "soil", "btn", "quake", "fire", "vbat"
-                )
-
-                if not all(name in fields for name in required):
-                    print("Rejected: incomplete message")
-                    refresh_liveness(current_time)
-                    continue
-
-                node_id = fields["node"]
-
-                try:
-                    sequence = int(fields["seq"])
-                except ValueError:
-                    print(f"Rejected: {node_id} has an invalid sequence number")
-                    refresh_liveness(current_time)
-                    continue
-
-                if sequence <= last_sequence[node_id]:
-                    print(
-                        f"Rejected: {node_id} replayed sequence "
-                        f"{sequence}"
+                else:
+                    required = (
+                        "node", "status", "seq", "t", "h", "p",
+                        "soil", "btn", "quake", "fire", "vbat"
                     )
-                    refresh_liveness(current_time)
-                    continue
 
-                try:
-                    battery_voltage = float(fields["vbat"])
-                except ValueError:
-                    battery_voltage = None
+                    if not all(name in fields for name in required):
+                        stats["rejected"] += 1
+                        print("Rejected: incomplete message")
+                    else:
+                        node_id = fields["node"]
 
-                last_sequence[node_id] = sequence
-                last_seen[node_id] = current_time
+                        try:
+                            sequence = int(fields["seq"])
+                        except ValueError:
+                            sequence = -1
 
-                node = nodes[node_id]
-                node["readings"] = fields
-                node["battery"] = (
-                    round(battery_voltage, 2)
-                    if battery_voltage is not None
-                    else None
-                )
-                node["battery_band"] = battery_band(battery_voltage)
+                        if sequence < 0:
+                            stats["rejected"] += 1
+                            print(
+                                f"Rejected: {node_id} has an "
+                                "invalid sequence number"
+                            )
+                        elif sequence <= last_sequence[node_id]:
+                            stats["rejected"] += 1
+                            print(
+                                f"Rejected: {node_id} replayed "
+                                f"sequence {sequence}"
+                            )
+                        else:
+                            try:
+                                battery_voltage = float(fields["vbat"])
+                            except ValueError:
+                                battery_voltage = None
 
-                refresh_liveness(current_time)
-                print_node_summary(node_id)
+                            last_sequence[node_id] = sequence
+                            last_seen[node_id] = current_time
+                            stats["accepted"] += 1
 
-            else:
-                # The timeout lets the gateway check node liveness even when
-                # no new packets are arriving.
-                refresh_liveness(current_time)
+                            node = nodes[node_id]
+                            node["readings"] = fields
+                            node["battery"] = (
+                                round(battery_voltage, 2)
+                                if battery_voltage is not None
+                                else None
+                            )
+                            node["battery_band"] = battery_band(
+                                battery_voltage
+                            )
+
+                            print_node_summary(node_id)
+
+            refresh_liveness(current_time)
+            write_state()
 
     except KeyboardInterrupt:
         print("\nGateway stopped")
