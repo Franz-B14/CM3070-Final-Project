@@ -1,16 +1,15 @@
 /*
   sketch_C_responder.ino
-  Stage C7 - warning severity levels
+  Stage C8 - actuator pre-movement warning
 
   Receives gateway command frames over LoRa and verifies:
     - sender is the gateway
     - HMAC-SHA256 signature
     - monotonically increasing sequence number
 
-  This revision distinguishes WARN from CRITICAL gateway commands.
-  CRITICAL keeps the hazard-specific warning rhythms. WARN uses a quieter,
-  infrequent attention pulse for a single-node or held hazard. This makes
-  responder signalling reflect the gateway's corroboration confidence.
+  This revision adds a short audible and visual warning before the barrier
+  servo moves. The actuator flashes its LED and sounder for 1.5 seconds before
+  changing position, then returns to the normal WARN, CRITICAL or OFF pattern.
 */
 
 #include <SPI.h>
@@ -42,6 +41,7 @@
 #define SERVO_ANGLE_OPEN    0
 #define SERVO_ANGLE_CLOSED 90
 #define SERVO_TRAVEL_MS   700
+#define PREMOVE_WARN_MS  1500
 
 // Gateway normally repeats its responder state every 30 seconds. Allow more
 // than three missed heartbeats before declaring the downlink stale.
@@ -639,8 +639,34 @@ void moveBarrier(const char *state) {
       ? SERVO_ANGLE_CLOSED
       : SERVO_ANGLE_OPEN;
 
-  // Attach only while the barrier is moving. This avoids continuously
-  // powering the servo once it reaches the requested position.
+  // Warn people close to the barrier before the mechanism starts moving.
+  if (PREMOVE_WARN_MS > 0) {
+    uint32_t until =
+      millis() + PREMOVE_WARN_MS;
+
+    while (millis() < until) {
+      digitalWrite(
+        LED_PIN,
+        HIGH
+      );
+      digitalWrite(
+        BUZZER_PIN,
+        HIGH
+      );
+      delay(100);
+
+      digitalWrite(
+        LED_PIN,
+        LOW
+      );
+      digitalWrite(
+        BUZZER_PIN,
+        LOW
+      );
+      delay(100);
+    }
+  }
+
   barrierServo.attach(
     SERVO_PIN,
     500,
@@ -655,6 +681,11 @@ void moveBarrier(const char *state) {
   Serial.print(state);
   Serial.print(" angle=");
   Serial.println(angle);
+
+  // The warning loop drove the output pins directly. Force the normal
+  // signalling state to be applied again after the servo has stopped.
+  activePattern = NULL;
+  updateSignalling();
 }
 
 
