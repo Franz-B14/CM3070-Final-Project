@@ -3,8 +3,7 @@
 SenseNode gateway with dashboard state output.
 
 Receives signed LoRa messages from up to three SenseNodes, tracks node
-liveness and battery status, and writes the latest state to a JSON file
-for the operator dashboard.
+status, writes dashboard state and sends signed commands to the responder.
 """
 
 import hashlib
@@ -29,6 +28,9 @@ NODE_KEYS = {
 NODE_ORDER = ["n1", "n2", "n3"]
 HEARTBEAT_TIMEOUT_S = 90.0
 
+# Placeholder used for signed gateway-to-responder commands.
+GATEWAY_KEY = b"REPLACE_WITH_GATEWAY_SECRET_KEY"
+
 VBAT_SAMPLE_INTERVAL_S = 15.0
 VBAT_WINDOW_POINTS = 60
 VBAT_MIN_POINTS = 20
@@ -42,6 +44,7 @@ last_seen = {node_id: None for node_id in NODE_ORDER}
 stats = {
     "accepted": 0,
     "rejected": 0,
+    "commands_sent": 0,
 }
 
 event_log = deque(maxlen=25)
@@ -67,6 +70,9 @@ nodes = {
     }
     for node_id in NODE_ORDER
 }
+
+gateway_sequence = 0
+last_command = ("OPEN", "OFF", "NONE")
 
 
 def now_text():
@@ -229,6 +235,60 @@ def get_active_hazards():
     return hazards
 
 
+def responder_state():
+    """Convert the current live hazards into a responder command."""
+    hazards = get_active_hazards()
+
+    if not hazards:
+        return ("OPEN", "OFF", "NONE")
+
+    barrier = "CLOSED" if "FLOOD" in hazards else "OPEN"
+    alarm = "CRITICAL"
+
+    priority = ["FLOOD", "QUAKE", "FIRE"]
+    active = [hazard for hazard in priority if hazard in hazards]
+
+    if len(active) > 1:
+        hazard = "MULTI"
+    else:
+        hazard = active[0]
+
+    return (barrier, alarm, hazard)
+
+
+def send_command(serial_port, barrier, alarm, hazard):
+    """Sign and send one command frame to the responder."""
+    global gateway_sequence
+
+    gateway_sequence += 1
+
+    payload = (
+        f"from=gw,seq={gateway_sequence},"
+        f"barrier={barrier},alarm={alarm},hazard={hazard}"
+    )
+
+    signature = hmac.new(
+        GATEWAY_KEY,
+        payload.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    message = f"TX:{payload}|{signature}\\n"
+
+    try:
+        serial_port.write(message.encode())
+        serial_port.flush()
+        stats["commands_sent"] += 1
+
+        print(
+            f"[CMD] seq={gateway_sequence} "
+            f"barrier={barrier} alarm={alarm} hazard={hazard}"
+        )
+    except serial.SerialException as error:
+        add_log("reject", f"Command send failed: {error}")
+        print("Command send failed:", error)
+
+
 def build_state():
     """Build the JSON object used by the dashboard."""
     hazards = sorted(get_active_hazards())
@@ -247,6 +307,10 @@ def build_state():
     return {
         "status": status,
         "hazard": hazard,
+        "alarm": last_command[1],
+        "barrier": last_command[0],
+        "barrier_commanded": last_command[0],
+        "barrier_confirmed": None,
         "updated": now_text(),
         "node_order": NODE_ORDER,
         "nodes": nodes,
@@ -289,6 +353,8 @@ def print_node_summary(node_id):
 
 
 def main():
+    global last_command
+
     try:
         ser = serial.Serial(PORT, BAUD, timeout=1)
     except serial.SerialException as error:
@@ -298,8 +364,11 @@ def main():
     print("SenseNode gateway started")
     print("Listening for:", ", ".join(NODE_ORDER))
     print("Dashboard state:", STATE_FILE)
+    print("Responder commands enabled")
     print("Press Ctrl+C to stop\n")
 
+    # Start by telling the responder the expected safe state.
+    send_command(ser, *last_command)
     write_state()
 
     try:
@@ -381,6 +450,33 @@ def main():
                             print_node_summary(node_id)
 
             refresh_liveness(current_time)
+
+            desired_command = responder_state()
+
+            if desired_command != last_command:
+                old_barrier, old_alarm, old_hazard = last_command
+                new_barrier, new_alarm, new_hazard = desired_command
+
+                if new_barrier != old_barrier:
+                    if new_barrier == "CLOSED":
+                        add_log(
+                            "flood",
+                            "Flood detected - commanding barrier CLOSED"
+                        )
+                    else:
+                        add_log(
+                            "clear",
+                            "Flood cleared - commanding barrier OPEN"
+                        )
+                elif new_alarm != old_alarm or new_hazard != old_hazard:
+                    add_log(
+                        "info",
+                        f"Alarm {new_alarm}, hazard {new_hazard}"
+                    )
+
+                send_command(ser, *desired_command)
+                last_command = desired_command
+
             write_state()
 
     except KeyboardInterrupt:
