@@ -7,10 +7,12 @@ showing system status, node readings, responder state and recent events.
 """
 
 import json
+import os
 
-from flask import Flask, Response
+from flask import Flask, Response, send_from_directory
 
 STATE_FILE = "/dev/shm/ews_state.json"
+CAP_DIR = os.path.expanduser("~/ews/cap")
 
 DEFAULT_STATE = {
     "status": "--",
@@ -19,6 +21,7 @@ DEFAULT_STATE = {
     "barrier": "OPEN",
     "barrier_commanded": "OPEN",
     "barrier_confirmed": None,
+    "cap": None,
     "updated": "-",
     "node_order": ["n1", "n2", "n3"],
     "nodes": {
@@ -29,7 +32,7 @@ DEFAULT_STATE = {
         "n3": {"live": False, "age": None, "battery": None,
                "battery_band": "-", "charge": "-", "readings": {}},
     },
-    "stats": {"accepted": 0, "rejected": 0, "commands_sent": 0},
+    "stats": {"accepted": 0, "rejected": 0, "commands_sent": 0, "cap_emitted": 0},
     "log": [],
 }
 
@@ -161,6 +164,60 @@ PAGE = """<!doctype html>
       flex-wrap: wrap;
     }
 
+    .cap-panel {
+      background: white;
+      border: 1px solid #ccc;
+      border-left: 8px solid #777;
+      margin-top: 16px;
+      padding: 14px;
+    }
+
+    .cap-panel.live {
+      border-left-color: #c0392b;
+      background: #fff5f4;
+    }
+
+    .cap-panel.clear {
+      border-left-color: #16865a;
+    }
+
+    .cap-panel h2 {
+      margin: 0 0 10px 0;
+      font-size: 18px;
+    }
+
+    .cap-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .cap-box {
+      border: 1px solid #ddd;
+      padding: 10px;
+    }
+
+    .cap-box span {
+      display: block;
+      color: #666;
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+
+    .cap-box strong {
+      font-size: 16px;
+    }
+
+    .cap-file {
+      margin-top: 10px;
+      font-size: 13px;
+    }
+
+    .cap-file a {
+      color: #34515e;
+    }
+
     .responder {
       background: white;
       border: 1px solid #ccc;
@@ -273,6 +330,40 @@ PAGE = """<!doctype html>
 
   <div id="nodes" class="nodes"></div>
 
+  <div id="capPanel" class="cap-panel">
+    <h2>CAP alert</h2>
+    <div id="capEmpty">No CAP alert has been emitted.</div>
+
+    <div id="capDetails" style="display:none">
+      <div class="cap-grid">
+        <div class="cap-box">
+          <span>Message type</span>
+          <strong id="capType">-</strong>
+        </div>
+
+        <div class="cap-box">
+          <span>Hazard</span>
+          <strong id="capHazard">-</strong>
+        </div>
+
+        <div class="cap-box">
+          <span>Certainty</span>
+          <strong id="capCertainty">-</strong>
+        </div>
+
+        <div class="cap-box">
+          <span>Sent</span>
+          <strong id="capSent">-</strong>
+        </div>
+      </div>
+
+      <div class="cap-file">
+        Latest CAP XML:
+        <a href="/cap/latest.xml" target="_blank" rel="noopener">latest.xml</a>
+      </div>
+    </div>
+  </div>
+
   <div class="responder">
     <h2>Responder state</h2>
     <div class="responder-grid">
@@ -301,6 +392,7 @@ PAGE = """<!doctype html>
   <div class="stats">
     <div>Accepted packets: <strong id="accepted">0</strong></div>
     <div>Rejected packets: <strong id="rejected">0</strong></div>
+    <div>CAP emitted: <strong id="capEmitted">0</strong></div>
     <div>Nodes live: <strong id="liveCount">0</strong>/<strong id="totalCount">0</strong></div>
   </div>
 
@@ -329,6 +421,45 @@ function batteryClass(band) {
     return "battery-good";
   }
   return "";
+}
+
+function updateCap(state) {
+  var cap = state.cap;
+  var panel = document.getElementById("capPanel");
+  var empty = document.getElementById("capEmpty");
+  var details = document.getElementById("capDetails");
+
+  panel.className = "cap-panel";
+
+  if (!cap) {
+    empty.style.display = "block";
+    details.style.display = "none";
+    return;
+  }
+
+  empty.style.display = "none";
+  details.style.display = "block";
+
+  var hazards = cap.hazards || {};
+  var hazardNames = Object.keys(hazards);
+
+  document.getElementById("capType").textContent =
+    valueOrDash(cap.msg_type);
+
+  document.getElementById("capHazard").textContent =
+    hazardNames.length ? hazardNames.join(" + ") : "-";
+
+  document.getElementById("capCertainty").textContent =
+    valueOrDash(cap.certainty);
+
+  document.getElementById("capSent").textContent =
+    valueOrDash(cap.sent);
+
+  if (cap.msg_type === "Cancel") {
+    panel.classList.add("clear");
+  } else {
+    panel.classList.add("live");
+  }
 }
 
 function updateResponder(state) {
@@ -373,6 +504,7 @@ function updateDashboard(state) {
     valueOrDash(state.hazard);
 
   updateResponder(state);
+  updateCap(state);
 
   var system = document.getElementById("system");
   system.className = "status";
@@ -427,6 +559,8 @@ function updateDashboard(state) {
     stats.accepted || 0;
   document.getElementById("rejected").textContent =
     stats.rejected || 0;
+  document.getElementById("capEmitted").textContent =
+    stats.cap_emitted || 0;
 
   var liveCount = 0;
   order.forEach(function(nodeId) {
@@ -490,6 +624,23 @@ def api_state():
         return Response(
             json.dumps(DEFAULT_STATE),
             mimetype="application/json"
+        )
+
+
+@app.route("/cap/latest.xml")
+def cap_latest():
+    """Serve the latest CAP XML message produced by the gateway."""
+    try:
+        return send_from_directory(
+            CAP_DIR,
+            "latest.xml",
+            mimetype="application/xml"
+        )
+    except Exception:
+        return Response(
+            "No CAP message has been emitted yet.",
+            status=404,
+            mimetype="text/plain"
         )
 
 
