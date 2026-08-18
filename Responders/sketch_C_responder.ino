@@ -1,15 +1,16 @@
 /*
   sketch_C_responder.ino
-  Stage C3 - persistent barrier state
+  Stage C4 - community beacon role
 
   Receives gateway command frames over LoRa and verifies:
     - sender is the gateway
     - HMAC-SHA256 signature
     - monotonically increasing sequence number
 
-  This revision stores the last authenticated barrier state in ESP32
-  Preferences and restores it on boot before normal LoRa command handling.
-  Public-beacon behaviour is added in a later revision.
+  This revision adds a second responder role for a public warning beacon.
+  The same authenticated command frame is used by both roles. The actuator
+  keeps its engineering display and servo behaviour; the beacon shows simple
+  public guidance and uses an LED/sounder when an alarm is active.
 */
 
 #include <SPI.h>
@@ -24,12 +25,19 @@
 // ---------------------------------------------------------------------------
 // Local configuration
 // ---------------------------------------------------------------------------
-// The same responder sketch will later support more than one hardware role.
-// At this stage only the a1 barrier actuator behaviour is implemented.
+// One firmware supports both responder roles. Change ROLE per board:
+//   a1 = barrier actuator
+//   b1 = community warning beacon
 #define ROLE "a1"
 
 #define IS_ACTUATOR   (strcmp(ROLE, "a1") == 0)
+#define IS_BEACON     (strcmp(ROLE, "b1") == 0)
 
+// Shown only on the public beacon display.
+#define SITE_NAME "COMMUNITY WARNING POINT"
+
+#define LED_PIN             4
+#define BUZZER_PIN         14
 #define SERVO_PIN          13
 #define SERVO_ANGLE_OPEN    0
 #define SERVO_ANGLE_CLOSED 90
@@ -81,6 +89,12 @@ static char lastReason[24] = "";
 static char cmdBarrier[8] = "OPEN";
 static char cmdAlarm[10] = "OFF";
 static char cmdHazard[8] = "NONE";
+
+// Generic public alarm pattern. Hazard-specific rhythms are added later.
+static bool signalOn = false;
+static uint32_t lastSignalChange = 0;
+static const uint32_t SIGNAL_ON_MS = 400;
+static const uint32_t SIGNAL_OFF_MS = 600;
 
 // ---------------------------------------------------------------------------
 // HMAC helpers
@@ -253,6 +267,152 @@ void recordReject(const char *reason) {
 
   Serial.print("[REJECT] ");
   Serial.println(reason);
+}
+
+
+// ---------------------------------------------------------------------------
+// Community beacon
+// ---------------------------------------------------------------------------
+bool alarmActive() {
+  return strcmp(
+    cmdAlarm,
+    "OFF"
+  ) != 0;
+}
+
+
+void serviceBeaconSignal() {
+  if (!IS_BEACON) {
+    return;
+  }
+
+  if (!alarmActive()) {
+    signalOn = false;
+    digitalWrite(
+      LED_PIN,
+      LOW
+    );
+    digitalWrite(
+      BUZZER_PIN,
+      LOW
+    );
+    return;
+  }
+
+  uint32_t interval =
+    signalOn
+      ? SIGNAL_ON_MS
+      : SIGNAL_OFF_MS;
+
+  if (
+    millis() - lastSignalChange
+    < interval
+  ) {
+    return;
+  }
+
+  lastSignalChange = millis();
+  signalOn = !signalOn;
+
+  digitalWrite(
+    LED_PIN,
+    signalOn ? HIGH : LOW
+  );
+
+  digitalWrite(
+    BUZZER_PIN,
+    signalOn ? HIGH : LOW
+  );
+}
+
+
+void beaconAdvice(
+  const char *hazard,
+  const char **line1,
+  const char **line2
+) {
+  if (
+    strcmp(
+      hazard,
+      "FLOOD"
+    ) == 0
+  ) {
+    *line1 = "Move to higher ground";
+    *line2 = "Avoid floodwater";
+  } else if (
+    strcmp(
+      hazard,
+      "QUAKE"
+    ) == 0
+  ) {
+    *line1 = "Drop, cover, hold on";
+    *line2 = "Keep clear of buildings";
+  } else if (
+    strcmp(
+      hazard,
+      "FIRE"
+    ) == 0
+  ) {
+    *line1 = "Extreme fire risk";
+    *line2 = "Avoid open flames";
+  } else {
+    *line1 = "Multiple hazards";
+    *line2 = "Follow local guidance";
+  }
+}
+
+
+void drawBeacon() {
+  display.clearDisplay();
+  display.setTextColor(
+    SSD1306_WHITE
+  );
+
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println(SITE_NAME);
+
+  display.drawLine(
+    0,
+    10,
+    OLED_W,
+    10,
+    SSD1306_WHITE
+  );
+
+  if (alarmActive()) {
+    const char *line1;
+    const char *line2;
+
+    beaconAdvice(
+      cmdHazard,
+      &line1,
+      &line2
+    );
+
+    display.setTextSize(2);
+    display.setCursor(0, 16);
+    display.println(cmdHazard);
+
+    display.setTextSize(1);
+    display.setCursor(0, 38);
+    display.println(line1);
+
+    display.setCursor(0, 50);
+    display.println(line2);
+  } else {
+    display.setTextSize(2);
+    display.setCursor(0, 18);
+    display.println("ALL CLEAR");
+
+    display.setTextSize(1);
+    display.setCursor(0, 44);
+    display.println(
+      "No hazard reported."
+    );
+  }
+
+  display.display();
 }
 
 
@@ -435,6 +595,10 @@ void handleFrame(char *frame) {
     persistBarrier(cmdBarrier);
   }
 
+  if (IS_BEACON) {
+    drawBeacon();
+  }
+
   acceptCount++;
 
   strncpy(
@@ -458,7 +622,7 @@ void handleFrame(char *frame) {
 // ---------------------------------------------------------------------------
 // Engineering display
 // ---------------------------------------------------------------------------
-void drawStatus() {
+void drawActuator() {
   display.clearDisplay();
   display.setTextColor(
     SSD1306_WHITE
@@ -490,12 +654,41 @@ void drawStatus() {
 }
 
 
+void drawStatus() {
+  if (IS_ACTUATOR) {
+    drawActuator();
+  } else {
+    drawBeacon();
+  }
+}
+
+
 // ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   delay(200);
 
   Wire.begin(21, 22);
+
+  pinMode(
+    LED_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    BUZZER_PIN,
+    OUTPUT
+  );
+
+  digitalWrite(
+    LED_PIN,
+    LOW
+  );
+
+  digitalWrite(
+    BUZZER_PIN,
+    LOW
+  );
 
   if (
     !display.begin(
@@ -610,4 +803,6 @@ void loop() {
     handleFrame(buffer);
     drawStatus();
   }
+
+  serviceBeaconSignal();
 }
