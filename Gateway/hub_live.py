@@ -3,7 +3,7 @@
 SenseNode gateway - initial version.
 
 Reads messages received by the LoRa receiver over the serial port,
-parses the sensor values and prints them to the terminal.
+parses the sensor values and reports flood and earthquake status.
 """
 
 import serial
@@ -44,7 +44,7 @@ def main():
 
             fields = parse_message(line)
 
-            required = ("temp", "hum", "pressure", "soil", "flood")
+            required = ("temp", "hum", "pressure", "soil", "flood", "quake")
             if not all(name in fields for name in required):
                 print("Invalid message:", line)
                 continue
@@ -54,7 +54,8 @@ def main():
                 "Humidity:", fields["hum"], "% |",
                 "Pressure:", fields["pressure"], "hPa |",
                 "Soil:", fields["soil"], "|",
-                "Flood:", fields["flood"]
+                "Flood:", fields["flood"], "|",
+                "Quake:", fields["quake"]
             )
 
     except KeyboardInterrupt:
