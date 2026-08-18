@@ -5,7 +5,8 @@
  * Sends the current readings to the gateway using LoRa and uses the
  * MPU6050 readings to detect unusual ground movement. It also uses
  * temperature and humidity to identify possible fire-weather conditions.
- * LoRa messages now include a node ID, sequence number and HMAC signature.
+ * LoRa messages include a node ID, sequence number and HMAC signature.
+ * This version also measures the board battery voltage.
  */
 
 #include <Wire.h>
@@ -29,6 +30,11 @@ const char* HMAC_KEY = "REPLACE_WITH_NODE_SECRET_KEY";
 #define SCL_PIN 22
 #define SOIL_PIN 34
 #define BTN_PIN 4
+
+// Battery voltage is available through the LilyGO board's onboard divider.
+#define VBAT_PIN 35
+#define VBAT_DIVIDER 2.0
+#define VBAT_SAMPLES 16
 
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
@@ -83,6 +89,20 @@ bool mpuFound = false;
 bool displayFound = false;
 bool loraFound = false;
 
+float readBatteryVoltage() {
+  unsigned long totalMillivolts = 0;
+
+  // Average several readings because the ESP32 ADC can be noisy.
+  for (int i = 0; i < VBAT_SAMPLES; i++) {
+    totalMillivolts += analogReadMilliVolts(VBAT_PIN);
+  }
+
+  float averageMillivolts =
+    totalMillivolts / (float)VBAT_SAMPLES;
+
+  return (averageMillivolts * VBAT_DIVIDER) / 1000.0;
+}
+
 String hmacSha256Hex(const char* key, const char* message) {
   byte mac[32];
   mbedtls_md_context_t context;
@@ -123,6 +143,9 @@ void setup() {
 
   Wire.begin(SDA_PIN, SCL_PIN);
   pinMode(BTN_PIN, INPUT_PULLUP);
+
+  // Use the wider ADC input range for the divided battery voltage.
+  analogSetPinAttenuation(VBAT_PIN, ADC_11db);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
     Serial.println("OLED display not found");
@@ -253,6 +276,7 @@ void loop() {
 
   int soilValue = analogRead(SOIL_PIN);
   bool buttonPressed = (digitalRead(BTN_PIN) == LOW);
+  float batteryVoltage = readBatteryVoltage();
 
   bool soilWet = (soilValue < SOIL_WET_THRESHOLD);
   bool floodDetected = soilWet || buttonPressed;
@@ -275,7 +299,10 @@ void loop() {
   Serial.print(", Quake: ");
   Serial.print(quakeDetected ? "QUAKE" : "OK");
   Serial.print(", Fire: ");
-  Serial.println(fireDetected ? "FIRE" : "OK");
+  Serial.print(fireDetected ? "FIRE" : "OK");
+  Serial.print(", Battery: ");
+  Serial.print(batteryVoltage, 2);
+  Serial.println(" V");
 
   if (displayFound) {
     display.clearDisplay();
@@ -297,6 +324,9 @@ void loop() {
     display.println(quakeDetected ? "YES" : "NO");
     display.print("Fire:  ");
     display.println(fireDetected ? "YES" : "NO");
+    display.print("Bat:   ");
+    display.print(batteryVoltage, 2);
+    display.println(" V");
     display.display();
   }
 
@@ -313,6 +343,7 @@ void loop() {
     payload += ",btn=" + String(buttonPressed ? 1 : 0);
     payload += ",quake=" + String(quakeDetected ? "QUAKE" : "OK");
     payload += ",fire=" + String(fireDetected ? "FIRE" : "OK");
+    payload += ",vbat=" + String(batteryVoltage, 2);
 
     String signature = hmacSha256Hex(HMAC_KEY, payload.c_str());
     String signedMessage = payload + "|" + signature;
