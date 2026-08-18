@@ -584,7 +584,7 @@ def main():
             # R2 CAP consumes the corroboration snapshot directly. This keeps
             # observing and held nodes separate when certainty is published.
             emitted = emitter.step(
-                bool(live_nodes),
+                live_nodes,
                 current_corroboration,
                 current_time
             )

@@ -89,52 +89,102 @@ class CapEmitter:
 
         return sequence
 
-    def decide(self, any_live, snapshot, timestamp):
+    def effective_snapshot(self, snapshot, live_nodes):
+        """
+        Keep an open hazard active unless a node that actually reported it
+        is live and no longer reports it.
+
+        Unrelated live nodes cannot clear a hazard they never witnessed.
+        """
+        effective = {
+            hazard: {
+                "observing": list(details.get("observing", [])),
+                "held": list(details.get("held", [])),
+                "certainty": details.get("certainty"),
+                "corroborated": details.get("corroborated", False),
+            }
+            for hazard, details in snapshot.items()
+        }
+
+        if not self.active:
+            return effective
+
+        live = set(live_nodes or ())
+
+        for hazard, previous in self.active.items():
+            if hazard in effective:
+                continue
+
+            witnesses = (
+                set(previous.get("observing", []))
+                | set(previous.get("held", []))
+            )
+
+            # A node that reported this hazard is live and the current snapshot
+            # no longer contains the hazard. That is evidence of stand-down.
+            if witnesses & live:
+                continue
+
+            # None of the original witnesses is currently able to confirm clear.
+            # Carry the incident forward as Unknown rather than cancelling it.
+            effective[hazard] = {
+                "observing": [],
+                "held": sorted(witnesses),
+                "certainty": "Unknown",
+                "corroborated": False,
+            }
+
+        return effective
+
+    def decide(self, live_nodes, snapshot, timestamp):
         """
         Return (message type, hazard specs), or None.
 
-        This R2 version still asks whether ANY SenseNode is live when deciding
-        whether an empty snapshot means all-clear. R3 will later make that
-        stand-down decision specific to the node that actually saw the hazard.
+        A hazard can be cancelled only when a node that previously reported
+        that hazard is live and the current corroboration snapshot no longer
+        contains it. Silence or unrelated live nodes are not an all-clear.
         """
-        if snapshot:
-            current_key = snapshot_key(snapshot)
+        effective = self.effective_snapshot(
+            snapshot,
+            live_nodes,
+        )
 
+        if not effective:
             if self.active is None:
-                return (
-                    "Alert",
-                    hazard_specs(snapshot),
-                )
+                return None
 
-            if current_key != self.active_key:
-                return (
-                    "Update",
-                    hazard_specs(snapshot),
-                )
-
-            if (
-                timestamp - self.last_emit_time
-                >= self.refresh_s
-            ):
-                return (
-                    "Update",
-                    hazard_specs(snapshot),
-                )
-
-            return None
-
-        if self.active is None:
-            return None
-
-        # No hazard remains in the corroborator. At this stage any live node is
-        # accepted as enough evidence to cancel the incident.
-        if any_live:
+            # Every hazard in the incident has been stood down by one of its
+            # own reporting nodes.
             return (
                 "Cancel",
                 hazard_specs(self.active),
             )
 
-        # Whole-fleet silence is not an all-clear. The last alert can expire.
+        current_key = snapshot_key(
+            effective
+        )
+
+        if self.active is None:
+            return (
+                "Alert",
+                hazard_specs(effective),
+            )
+
+        if current_key != self.active_key:
+            return (
+                "Update",
+                hazard_specs(effective),
+            )
+
+        if (
+            timestamp - self.last_emit_time
+            >= self.refresh_s
+        ):
+            return (
+                "Update",
+                hazard_specs(effective),
+            )
+
         return None
 
     def write_message(self, xml, msg_type):
@@ -179,7 +229,7 @@ class CapEmitter:
 
         return path
 
-    def step(self, any_live, snapshot, timestamp=None):
+    def step(self, live_nodes, snapshot, timestamp=None):
         """Evaluate the CAP state machine and emit only when required."""
         timestamp = (
             time.time()
@@ -188,7 +238,7 @@ class CapEmitter:
         )
 
         decision = self.decide(
-            any_live,
+            live_nodes,
             snapshot,
             timestamp,
         )
@@ -290,8 +340,12 @@ class CapEmitter:
 
 
 def run_self_test():
-    """Exercise certainty changes and the initial R2 cancellation rule."""
-    workdir = tempfile.mkdtemp(prefix="capemit-r2-")
+    """Exercise the per-hazard R3 stand-down rule."""
+    import shutil
+
+    workdir = tempfile.mkdtemp(
+        prefix="capemit-r3-"
+    )
 
     def snap(observing=None, held=None):
         observing = list(observing or [])
@@ -316,25 +370,59 @@ def run_self_test():
     try:
         emitter = CapEmitter(
             out_dir=workdir,
-            seq_path=os.path.join(workdir, "seq"),
-            refresh_s=20,
+            seq_path=os.path.join(
+                workdir,
+                "seq"
+            ),
+            refresh_s=30,
         )
 
         timestamp = 1000.0
+
         tests = [
-            ("quiet", True, {}, None),
-            ("n1 flood", True, snap(["n1"]), "Alert"),
-            ("n2 joins", True, snap(["n1", "n2"]), "Update"),
-            ("n1 lost", True, snap(["n2"], ["n1"]), "Update"),
-            ("held only", True, snap([], ["n1"]), "Update"),
-            ("hold expires", True, {}, "Cancel"),
+            (
+                "quiet",
+                ["n1", "n2", "n3"],
+                {},
+                None,
+            ),
+            (
+                "n1 reports flood",
+                ["n1", "n2", "n3"],
+                snap(["n1"]),
+                "Alert",
+            ),
+            (
+                "n1 lost, held",
+                ["n2", "n3"],
+                snap([], ["n1"]),
+                "Update",
+            ),
+            (
+                "hold expires, bystanders live",
+                ["n2", "n3"],
+                {},
+                None,
+            ),
+            (
+                "still no witness",
+                ["n2", "n3"],
+                {},
+                None,
+            ),
+            (
+                "n1 returns clear",
+                ["n1", "n2", "n3"],
+                {},
+                "Cancel",
+            ),
         ]
 
         passed = True
 
-        for label, any_live, snapshot, expected in tests:
+        for label, live_nodes, snapshot, expected in tests:
             result = emitter.step(
-                any_live,
+                live_nodes,
                 snapshot,
                 timestamp,
             )
@@ -349,7 +437,8 @@ def run_self_test():
             passed = passed and ok
 
             print(
-                f"{label:<14} expected={str(expected):<7} "
+                f"{label:<30} "
+                f"expected={str(expected):<7} "
                 f"actual={str(actual):<7} "
                 f"{'OK' if ok else 'FAIL'}"
             )
@@ -359,7 +448,6 @@ def run_self_test():
         return passed
 
     finally:
-        import shutil
         shutil.rmtree(
             workdir,
             ignore_errors=True,
