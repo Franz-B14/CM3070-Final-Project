@@ -13,6 +13,7 @@ import json
 import os
 import serial
 import time
+from collections import deque
 from datetime import datetime
 
 PORT = "/dev/ttyACM0"
@@ -28,6 +29,13 @@ NODE_KEYS = {
 NODE_ORDER = ["n1", "n2", "n3"]
 HEARTBEAT_TIMEOUT_S = 90.0
 
+VBAT_SAMPLE_INTERVAL_S = 15.0
+VBAT_WINDOW_POINTS = 60
+VBAT_MIN_POINTS = 20
+VBAT_MIN_SPAN_S = 300.0
+VBAT_SLOPE_EPS = 0.001
+VBAT_FULL_V = 4.15
+
 last_sequence = {node_id: 0 for node_id in NODE_ORDER}
 last_seen = {node_id: None for node_id in NODE_ORDER}
 
@@ -36,12 +44,25 @@ stats = {
     "rejected": 0,
 }
 
+event_log = deque(maxlen=25)
+
+vbat_history = {
+    node_id: deque(maxlen=VBAT_WINDOW_POINTS)
+    for node_id in NODE_ORDER
+}
+
+vbat_last_sample = {
+    node_id: 0.0
+    for node_id in NODE_ORDER
+}
+
 nodes = {
     node_id: {
         "live": False,
         "age": None,
         "battery": None,
         "battery_band": "-",
+        "charge": "-",
         "readings": {}
     }
     for node_id in NODE_ORDER
@@ -50,6 +71,15 @@ nodes = {
 
 def now_text():
     return datetime.now().strftime("%H:%M:%S")
+
+
+def add_log(kind, message):
+    """Add one item to the most recent event list."""
+    event_log.appendleft({
+        "time": now_text(),
+        "kind": kind,
+        "text": message,
+    })
 
 
 def parse_fields(payload):
@@ -104,6 +134,51 @@ def battery_band(voltage):
     return "Critical"
 
 
+def charge_state(node_id, voltage, current_time):
+    """Estimate whether the battery voltage is rising or falling."""
+    if voltage is None:
+        return "-"
+
+    if current_time - vbat_last_sample[node_id] >= VBAT_SAMPLE_INTERVAL_S:
+        vbat_last_sample[node_id] = current_time
+        vbat_history[node_id].append((current_time, voltage))
+
+    history = vbat_history[node_id]
+
+    if len(history) < VBAT_MIN_POINTS:
+        return "Measuring"
+
+    if history[-1][0] - history[0][0] < VBAT_MIN_SPAN_S:
+        return "Measuring"
+
+    start_time = history[0][0]
+    xs = [(point[0] - start_time) / 60.0 for point in history]
+    ys = [point[1] for point in history]
+
+    count = len(xs)
+    mean_x = sum(xs) / count
+    mean_y = sum(ys) / count
+
+    denominator = sum((x - mean_x) ** 2 for x in xs)
+
+    if denominator == 0:
+        return "Measuring"
+
+    slope = sum(
+        (xs[i] - mean_x) * (ys[i] - mean_y)
+        for i in range(count)
+    ) / denominator
+
+    if voltage >= VBAT_FULL_V and abs(slope) < VBAT_SLOPE_EPS:
+        return "Full (float)"
+    if slope > VBAT_SLOPE_EPS:
+        return "Charging"
+    if slope < -VBAT_SLOPE_EPS:
+        return "Discharging"
+
+    return "Steady"
+
+
 def refresh_liveness(current_time):
     """Mark nodes offline when no message has been received recently."""
     for node_id in NODE_ORDER:
@@ -120,12 +195,16 @@ def refresh_liveness(current_time):
             node["live"] = age <= HEARTBEAT_TIMEOUT_S
 
         if node["live"] and not was_live:
+            add_log("info", f"{node_id} back online")
             print(f"[{node_id}] online")
         elif was_live and not node["live"]:
-            print(
-                f"[{node_id}] lost - no message for "
+            message = (
+                f"{node_id} lost - no message for "
                 f"{HEARTBEAT_TIMEOUT_S:.0f} seconds"
             )
+            add_log("reject", message)
+            print(f"[{node_id}] lost - no message for "
+                  f"{HEARTBEAT_TIMEOUT_S:.0f} seconds")
 
 
 def get_active_hazards():
@@ -172,6 +251,7 @@ def build_state():
         "node_order": NODE_ORDER,
         "nodes": nodes,
         "stats": stats,
+        "log": list(event_log),
     }
 
 
@@ -203,7 +283,8 @@ def print_node_summary(node_id):
         f"Temp={readings.get('t')} C | "
         f"Hum={readings.get('h')} % | "
         f"Soil={readings.get('soil')} | "
-        f"Battery={node['battery']} V ({node['battery_band']})"
+        f"Battery={node['battery']} V "
+        f"({node['battery_band']}, {node['charge']})"
     )
 
 
@@ -231,6 +312,7 @@ def main():
 
                 if not valid:
                     stats["rejected"] += 1
+                    add_log("reject", reason)
                     print("Rejected:", reason)
                 else:
                     required = (
@@ -240,6 +322,7 @@ def main():
 
                     if not all(name in fields for name in required):
                         stats["rejected"] += 1
+                        add_log("reject", "Incomplete message received")
                         print("Rejected: incomplete message")
                     else:
                         node_id = fields["node"]
@@ -251,12 +334,20 @@ def main():
 
                         if sequence < 0:
                             stats["rejected"] += 1
+                            add_log(
+                                "reject",
+                                f"{node_id} sent an invalid sequence number"
+                            )
                             print(
                                 f"Rejected: {node_id} has an "
                                 "invalid sequence number"
                             )
                         elif sequence <= last_sequence[node_id]:
                             stats["rejected"] += 1
+                            add_log(
+                                "reject",
+                                f"{node_id} replayed sequence {sequence}"
+                            )
                             print(
                                 f"Rejected: {node_id} replayed "
                                 f"sequence {sequence}"
@@ -280,6 +371,11 @@ def main():
                             )
                             node["battery_band"] = battery_band(
                                 battery_voltage
+                            )
+                            node["charge"] = charge_state(
+                                node_id,
+                                battery_voltage,
+                                current_time
                             )
 
                             print_node_summary(node_id)
