@@ -373,23 +373,6 @@ def active_hazard_map():
     }
 
 
-def cap_hazard_map(snapshot):
-    """
-    Convert the R1 snapshot to the node-list format used by the first CAP
-    emitter. Held nodes are included here so their hazard is not lost.
-
-    A later CAP revision will consume the snapshot directly so held nodes do
-    not incorrectly contribute to certainty.
-    """
-    return {
-        hazard: sorted(
-            set(details.get("observing", []))
-            | set(details.get("held", []))
-        )
-        for hazard, details in snapshot.items()
-    }
-
-
 def build_state():
     """Build the JSON object used by the dashboard."""
     hazards = sorted(current_corroboration)
@@ -595,15 +578,11 @@ def main():
             )
             corr.prune(current_time)
 
-            # The C3 emitter still expects {hazard: [nodes]}, so bridge the
-            # richer R1 snapshot back to that format for now.
-            hazard_map = cap_hazard_map(
-                current_corroboration
-            )
-
+            # R2 CAP consumes the corroboration snapshot directly. This keeps
+            # observing and held nodes separate when certainty is published.
             emitted = emitter.step(
                 bool(live_nodes),
-                hazard_map,
+                current_corroboration,
                 current_time
             )
 

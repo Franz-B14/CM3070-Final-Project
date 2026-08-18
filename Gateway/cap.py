@@ -151,11 +151,43 @@ def reference_to(sender, identifier, sent):
 
 
 def certainty_for(nodes):
-    """Two or more reporting nodes gives stronger certainty."""
-    if len(nodes) >= 2:
-        return "Observed"
+    """Fallback certainty used by the original tuple input format."""
+    return "Observed" if len(nodes) >= 2 else "Likely"
 
-    return "Likely"
+
+def normalise_hazard(entry):
+    """
+    Accept either the original tuple form or the richer corroboration form.
+
+    Original:
+        ("FLOOD", ["n1", "n2"])
+
+    Corroboration:
+        {
+            "hazard": "FLOOD",
+            "observing": ["n2"],
+            "held": ["n1"],
+            "certainty": "Likely"
+        }
+    """
+    if isinstance(entry, dict):
+        return {
+            "hazard": entry["hazard"],
+            "observing": list(entry.get("observing") or []),
+            "held": list(entry.get("held") or []),
+            "certainty": entry.get("certainty"),
+        }
+
+    hazard = entry[0]
+    nodes = list(entry[1] or [])
+    certainty = entry[2] if len(entry) > 2 else None
+
+    return {
+        "hazard": hazard,
+        "observing": nodes,
+        "held": [],
+        "certainty": certainty,
+    }
 
 
 def add_element(parent, tag, text):
@@ -166,7 +198,7 @@ def add_element(parent, tag, text):
 
 
 def add_area(info, nodes):
-    """Add one CAP area for each node reporting the hazard."""
+    """Add one CAP area for every node that reported the hazard."""
     if not nodes:
         area = ET.SubElement(info, f"{{{CAP_NS}}}area")
         add_element(area, "areaDesc", FALLBACK_AREA_DESC)
@@ -192,19 +224,26 @@ def add_area(info, nodes):
         )
 
 
-def add_info(alert, hazard, nodes, expires, msg_type):
-    """Add the CAP <info> block for one hazard."""
+def add_info(alert, spec, expires, msg_type):
+    """Add one CAP <info> block using the corroborator's evidence."""
+    hazard = spec["hazard"]
+    observing = spec["observing"]
+    held = spec["held"]
+    reporting_nodes = observing + held
+
     profile = dict(HAZARD_PROFILE[hazard])
 
     if msg_type == "Cancel":
         profile.update(ALL_CLEAR)
         certainty = "Observed"
     else:
-        certainty = certainty_for(nodes)
+        certainty = (
+            spec["certainty"]
+            or certainty_for(observing)
+        )
 
     info = ET.SubElement(alert, f"{{{CAP_NS}}}info")
 
-    # Keep these in CAP schema order.
     add_element(info, "language", "en-GB")
     add_element(info, "category", profile["category"])
     add_element(info, "event", profile["event"])
@@ -218,20 +257,36 @@ def add_info(alert, hazard, nodes, expires, msg_type):
     add_element(info, "description", profile["description"])
     add_element(info, "instruction", profile["instruction"])
 
-    # Include the node evidence behind the certainty value.
-    parameter = ET.SubElement(info, f"{{{CAP_NS}}}parameter")
-    add_element(parameter, "valueName", "ReportingNodes")
-    add_element(
-        parameter,
-        "value",
-        " ".join(nodes) if nodes else "none"
-    )
+    parameters = [
+        (
+            "ReportingNodes",
+            " ".join(observing) if observing else "none",
+        ),
+        (
+            "ReportingNodeCount",
+            len(observing),
+        ),
+    ]
 
-    parameter = ET.SubElement(info, f"{{{CAP_NS}}}parameter")
-    add_element(parameter, "valueName", "ReportingNodeCount")
-    add_element(parameter, "value", len(nodes))
+    if held:
+        parameters.append(
+            ("HeldNodes", " ".join(held))
+        )
+        parameters.append(
+            ("HeldNodeCount", len(held))
+        )
 
-    add_area(info, nodes)
+    for name, value in parameters:
+        parameter = ET.SubElement(
+            info,
+            f"{{{CAP_NS}}}parameter"
+        )
+        add_element(parameter, "valueName", name)
+        add_element(parameter, "value", value)
+
+    # Held nodes remain part of the warning area because that is where the
+    # hazard was reported, even though they do not count toward certainty.
+    add_area(info, reporting_nodes)
 
 
 def build_alert(
@@ -245,9 +300,16 @@ def build_alert(
     """
     Build one CAP message.
 
-    hazards is a list such as:
+    hazards may still use the original tuple form:
         [("FLOOD", ["n1"])]
-        [("FLOOD", ["n1", "n2"]), ("QUAKE", ["n3"])]
+
+    or the corroboration-aware dictionary form:
+        [{
+            "hazard": "FLOOD",
+            "observing": ["n2"],
+            "held": ["n1"],
+            "certainty": "Likely"
+        }]
 
     seq is a monotonic message counter supplied by the caller.
 
@@ -265,9 +327,16 @@ def build_alert(
             f"{msg_type} requires references to the earlier message"
         )
 
-    for hazard, _ in hazards:
-        if hazard not in HAZARD_PROFILE:
-            raise ValueError(f"unknown hazard: {hazard}")
+    specs = [
+        normalise_hazard(entry)
+        for entry in hazards
+    ]
+
+    for spec in specs:
+        if spec["hazard"] not in HAZARD_PROFILE:
+            raise ValueError(
+                f"unknown hazard: {spec['hazard']}"
+            )
 
     now = sent_dt or datetime.now(timezone.utc)
     sent = cap_time(now)
@@ -291,11 +360,10 @@ def build_alert(
     if references:
         add_element(alert, "references", references)
 
-    for hazard, nodes in hazards:
+    for spec in specs:
         add_info(
             alert,
-            hazard,
-            list(nodes or []),
+            spec,
             expires,
             msg_type
         )
