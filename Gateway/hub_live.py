@@ -31,6 +31,10 @@ HEARTBEAT_TIMEOUT_S = 90.0
 # Placeholder used for signed gateway-to-responder commands.
 GATEWAY_KEY = b"REPLACE_WITH_GATEWAY_SECRET_KEY"
 
+GW_SEQ_PATH = os.path.expanduser("~/ews/gw_seq")
+COMMAND_HEARTBEAT_S = 30.0
+COMMAND_MIN_GAP_S = 5.0
+
 VBAT_SAMPLE_INTERVAL_S = 15.0
 VBAT_WINDOW_POINTS = 60
 VBAT_MIN_POINTS = 20
@@ -71,7 +75,6 @@ nodes = {
     for node_id in NODE_ORDER
 }
 
-gateway_sequence = 0
 last_command = ("OPEN", "OFF", "NONE")
 
 
@@ -256,14 +259,35 @@ def responder_state():
     return (barrier, alarm, hazard)
 
 
+def next_gateway_sequence():
+    """Return a sequence number that survives gateway restarts."""
+    sequence = 0
+
+    if os.path.exists(GW_SEQ_PATH):
+        try:
+            with open(GW_SEQ_PATH) as file:
+                sequence = int(file.read().strip() or 0)
+        except ValueError:
+            sequence = 0
+
+    sequence += 1
+
+    directory = os.path.dirname(GW_SEQ_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    with open(GW_SEQ_PATH, "w") as file:
+        file.write(str(sequence))
+
+    return sequence
+
+
 def send_command(serial_port, barrier, alarm, hazard):
     """Sign and send one command frame to the responder."""
-    global gateway_sequence
-
-    gateway_sequence += 1
+    sequence = next_gateway_sequence()
 
     payload = (
-        f"from=gw,seq={gateway_sequence},"
+        f"from=gw,seq={sequence},"
         f"barrier={barrier},alarm={alarm},hazard={hazard}"
     )
 
@@ -273,7 +297,7 @@ def send_command(serial_port, barrier, alarm, hazard):
         hashlib.sha256
     ).hexdigest()
 
-    message = f"TX:{payload}|{signature}\\n"
+    message = f"TX:{payload}|{signature}\n"
 
     try:
         serial_port.write(message.encode())
@@ -281,7 +305,7 @@ def send_command(serial_port, barrier, alarm, hazard):
         stats["commands_sent"] += 1
 
         print(
-            f"[CMD] seq={gateway_sequence} "
+            f"[CMD] seq={sequence} "
             f"barrier={barrier} alarm={alarm} hazard={hazard}"
         )
     except serial.SerialException as error:
@@ -355,6 +379,9 @@ def print_node_summary(node_id):
 def main():
     global last_command
 
+    last_command_time = 0.0
+    contact_warned = False
+
     try:
         ser = serial.Serial(PORT, BAUD, timeout=1)
     except serial.SerialException as error:
@@ -369,12 +396,21 @@ def main():
 
     # Start by telling the responder the expected safe state.
     send_command(ser, *last_command)
+    last_command_time = time.time()
     write_state()
 
     try:
         while True:
             line = ser.readline().decode(errors="replace").strip()
             current_time = time.time()
+
+            # The LoRa modem also returns diagnostic lines such as #TXOK.
+            # These are not SenseNode packets and should not be verified.
+            if line.startswith("#"):
+                if line.startswith("#ERR"):
+                    add_log("reject", f"Modem: {line[1:]}")
+                    print("[MODEM]", line)
+                line = ""
 
             if line:
                 valid, reason, fields = verify_message(line)
@@ -451,31 +487,71 @@ def main():
 
             refresh_liveness(current_time)
 
+            live_nodes = [
+                node_id
+                for node_id in NODE_ORDER
+                if nodes[node_id]["live"]
+            ]
+
             desired_command = responder_state()
 
-            if desired_command != last_command:
+            # Losing every node is not evidence that an earlier hazard cleared.
+            # Keep the previous responder state until at least one node returns.
+            if not live_nodes:
+                if last_command != ("OPEN", "OFF", "NONE"):
+                    if not contact_warned:
+                        add_log(
+                            "reject",
+                            "All SenseNodes lost - holding last responder state"
+                        )
+                        print(
+                            "[FAIL-SAFE] all nodes lost - "
+                            "holding last command"
+                        )
+                        contact_warned = True
+
+                desired_command = last_command
+            else:
+                contact_warned = False
+
+            changed = desired_command != last_command
+            heartbeat_due = (
+                current_time - last_command_time
+                >= COMMAND_HEARTBEAT_S
+            )
+            gap_ok = (
+                current_time - last_command_time
+                >= COMMAND_MIN_GAP_S
+            )
+
+            if (changed and gap_ok) or heartbeat_due:
                 old_barrier, old_alarm, old_hazard = last_command
                 new_barrier, new_alarm, new_hazard = desired_command
 
-                if new_barrier != old_barrier:
-                    if new_barrier == "CLOSED":
+                if changed:
+                    if new_barrier != old_barrier:
+                        if new_barrier == "CLOSED":
+                            add_log(
+                                "flood",
+                                "Flood detected - commanding barrier CLOSED"
+                            )
+                        else:
+                            add_log(
+                                "clear",
+                                "Flood cleared - commanding barrier OPEN"
+                            )
+                    elif (
+                        new_alarm != old_alarm
+                        or new_hazard != old_hazard
+                    ):
                         add_log(
-                            "flood",
-                            "Flood detected - commanding barrier CLOSED"
+                            "info",
+                            f"Alarm {new_alarm}, hazard {new_hazard}"
                         )
-                    else:
-                        add_log(
-                            "clear",
-                            "Flood cleared - commanding barrier OPEN"
-                        )
-                elif new_alarm != old_alarm or new_hazard != old_hazard:
-                    add_log(
-                        "info",
-                        f"Alarm {new_alarm}, hazard {new_hazard}"
-                    )
 
                 send_command(ser, *desired_command)
                 last_command = desired_command
+                last_command_time = current_time
 
             write_state()
 
