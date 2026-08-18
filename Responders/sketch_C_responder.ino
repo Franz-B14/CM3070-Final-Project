@@ -1,14 +1,15 @@
 /*
   sketch_C_responder.ino
-  Stage C1 - signed responder command receiver
+  Stage C2 - barrier actuator role
 
   Receives gateway command frames over LoRa and verifies:
     - sender is the gateway
     - HMAC-SHA256 signature
     - monotonically increasing sequence number
 
-  At this stage the responder only accepts and displays commands.
-  Actuator and public-beacon behaviour are added in later revisions.
+  This revision adds the a1 barrier actuator role. An authenticated
+  barrier command moves the servo only when the requested state changes.
+  Public-beacon behaviour is added in a later revision.
 */
 
 #include <SPI.h>
@@ -16,11 +17,25 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <ESP32Servo.h>
 #include "mbedtls/md.h"
 
 // ---------------------------------------------------------------------------
 // Local configuration
 // ---------------------------------------------------------------------------
+// The same responder sketch will later support more than one hardware role.
+// At this stage only the a1 barrier actuator behaviour is implemented.
+#define ROLE "a1"
+
+#define IS_ACTUATOR   (strcmp(ROLE, "a1") == 0)
+
+#define SERVO_PIN          13
+#define SERVO_ANGLE_OPEN    0
+#define SERVO_ANGLE_CLOSED 90
+#define SERVO_TRAVEL_MS   700
+
+Servo barrierServo;
+
 static const char *KEY_GW =
   "REPLACE_WITH_GATEWAY_SECRET_KEY";
 
@@ -240,6 +255,41 @@ void recordReject(const char *reason) {
 
 
 // ---------------------------------------------------------------------------
+// Barrier actuator
+// ---------------------------------------------------------------------------
+void moveBarrier(const char *state) {
+  if (!IS_ACTUATOR) {
+    return;
+  }
+
+  int angle =
+    strcmp(
+      state,
+      "CLOSED"
+    ) == 0
+      ? SERVO_ANGLE_CLOSED
+      : SERVO_ANGLE_OPEN;
+
+  // Attach only while the barrier is moving. This avoids continuously
+  // powering the servo once it reaches the requested position.
+  barrierServo.attach(
+    SERVO_PIN,
+    500,
+    2400
+  );
+
+  barrierServo.write(angle);
+  delay(SERVO_TRAVEL_MS);
+  barrierServo.detach();
+
+  Serial.print("[SERVO] ");
+  Serial.print(state);
+  Serial.print(" angle=");
+  Serial.println(angle);
+}
+
+
+// ---------------------------------------------------------------------------
 // Signed command handling
 // ---------------------------------------------------------------------------
 void handleFrame(char *frame) {
@@ -319,11 +369,13 @@ void handleFrame(char *frame) {
 
   lastSeqGw = sequence;
 
+  char newBarrier[8] = "";
+
   getField(
     payload,
     "barrier",
-    cmdBarrier,
-    sizeof(cmdBarrier)
+    newBarrier,
+    sizeof(newBarrier)
   );
 
   getField(
@@ -339,6 +391,27 @@ void handleFrame(char *frame) {
     cmdHazard,
     sizeof(cmdHazard)
   );
+
+  if (
+    IS_ACTUATOR &&
+    newBarrier[0] &&
+    strcmp(
+      newBarrier,
+      cmdBarrier
+    ) != 0
+  ) {
+    strncpy(
+      cmdBarrier,
+      newBarrier,
+      sizeof(cmdBarrier) - 1
+    );
+
+    cmdBarrier[
+      sizeof(cmdBarrier) - 1
+    ] = '\0';
+
+    moveBarrier(cmdBarrier);
+  }
 
   acceptCount++;
 
