@@ -3,7 +3,8 @@
  *
  * Reads the environmental sensors and checks for a possible flood.
  * Sends the current readings to the gateway using LoRa and uses the
- * MPU6050 readings to detect unusual ground movement.
+ * MPU6050 readings to detect unusual ground movement. A short hold period
+ * is used so that a detected event is not cleared immediately.
  */
 
 #include <Wire.h>
@@ -40,7 +41,9 @@ const int SAMPLE_RATE_HZ = 100;
 const int STA_SAMPLES = 40;       // 0.4 seconds
 const int LTA_SAMPLES = 500;      // 5 seconds
 const float QUAKE_RATIO_THRESHOLD = 3.5;
+const float LTA_NOISE_FLOOR = 0.05;
 const float GRAVITY_BASELINE = 9.82;
+const unsigned long QUAKE_HOLD_MS = 3000;
 
 const unsigned long ACCEL_INTERVAL_MS = 1000UL / SAMPLE_RATE_HZ;
 const unsigned long SENSOR_INTERVAL_MS = 1000;
@@ -55,6 +58,7 @@ unsigned long accelSampleCount = 0;
 unsigned long lastAccelSample = 0;
 unsigned long lastSensorRead = 0;
 bool quakeDetected = false;
+unsigned long quakeHoldUntil = 0;
 
 Adafruit_BME280 bme;
 Adafruit_MPU6050 mpu;
@@ -143,10 +147,19 @@ void updateEarthquakeDetection(float magnitude) {
   float staAverage = staSum / STA_SAMPLES;
   float ltaAverage = ltaSum / LTA_SAMPLES;
 
-  if (ltaAverage > 0.0) {
-    float ratio = staAverage / ltaAverage;
-    quakeDetected = (ratio >= QUAKE_RATIO_THRESHOLD);
-  } else {
+  // Prevent very small background values from producing a large ratio.
+  float effectiveLta = ltaAverage;
+  if (effectiveLta < LTA_NOISE_FLOOR) {
+    effectiveLta = LTA_NOISE_FLOOR;
+  }
+
+  float ratio = staAverage / effectiveLta;
+  unsigned long now = millis();
+
+  if (ratio >= QUAKE_RATIO_THRESHOLD) {
+    quakeDetected = true;
+    quakeHoldUntil = now + QUAKE_HOLD_MS;
+  } else if (quakeDetected && now >= quakeHoldUntil) {
     quakeDetected = false;
   }
 }
