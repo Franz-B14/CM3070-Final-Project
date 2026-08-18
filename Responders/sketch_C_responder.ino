@@ -1,16 +1,16 @@
 /*
   sketch_C_responder.ino
-  Stage C5 - stale gateway fail-safe
+  Stage C6 - hazard-specific warning rhythms
 
   Receives gateway command frames over LoRa and verifies:
     - sender is the gateway
     - HMAC-SHA256 signature
     - monotonically increasing sequence number
 
-  This revision tracks the last valid authenticated gateway command.
-  Silence is not treated as an all-clear: after the gateway link becomes
-  stale, the actuator holds its last barrier state and the public beacon shows
-  NO SIGNAL. An alarm already in progress continues through contact loss.
+  This revision replaces the generic warning pulse with hazard-specific
+  LED and active-sounder rhythms. FLOOD, QUAKE, FIRE and MULTI can therefore
+  be distinguished without reading the OLED. The stale state keeps a quiet
+  LED-only pattern and an active warning still continues through contact loss.
 */
 
 #include <SPI.h>
@@ -98,11 +98,58 @@ static char cmdBarrier[8] = "OPEN";
 static char cmdAlarm[10] = "OFF";
 static char cmdHazard[8] = "NONE";
 
-// Generic public alarm pattern. Hazard-specific rhythms are added later.
-static bool signalOn = false;
-static uint32_t lastSignalChange = 0;
-static const uint32_t SIGNAL_ON_MS = 400;
-static const uint32_t SIGNAL_OFF_MS = 600;
+// ---------------------------------------------------------------------------
+// LED / active-sounder signalling patterns
+// ---------------------------------------------------------------------------
+struct Step {
+  bool led;
+  bool buzzer;
+  uint16_t durationMs;
+};
+
+static const Step PAT_OFF[] = {
+  {false, false, 1000}
+};
+
+static const Step PAT_FLOOD[] = {
+  {true,  true,  800},
+  {false, false, 400}
+};
+
+static const Step PAT_QUAKE[] = {
+  {true,  true,  120},
+  {false, false, 120},
+  {true,  true,  120},
+  {false, false, 120},
+  {true,  true,  120},
+  {false, false, 900}
+};
+
+static const Step PAT_FIRE[] = {
+  {true,  true,  400},
+  {false, false, 300},
+  {true,  true,  400},
+  {false, false, 1500}
+};
+
+static const Step PAT_MULTI[] = {
+  {true,  true,  300},
+  {false, false, 300}
+};
+
+// Stale contact is deliberately visual only. Unknown status is not itself
+// treated as evidence of a hazard.
+static const Step PAT_STALE[] = {
+  {true,  false, 100},
+  {false, false, 150},
+  {true,  false, 100},
+  {false, false, 2700}
+};
+
+static const Step *activePattern = PAT_OFF;
+static uint8_t patternLength = 1;
+static uint8_t patternIndex = 0;
+static uint32_t patternLastChange = 0;
 
 // ---------------------------------------------------------------------------
 // HMAC helpers
@@ -301,86 +348,125 @@ bool alarmActive() {
 }
 
 
-void serviceBeaconSignal() {
-  if (!IS_BEACON) {
+void setPattern(
+  const Step *steps,
+  uint8_t length
+) {
+  if (activePattern == steps) {
     return;
   }
 
-  bool stale =
-    isGatewayStale();
-
-  // An already active alarm keeps sounding even if the gateway later goes
-  // silent. Silence cannot clear a warning.
-  if (alarmActive()) {
-    uint32_t interval =
-      signalOn
-        ? SIGNAL_ON_MS
-        : SIGNAL_OFF_MS;
-
-    if (
-      millis() - lastSignalChange
-      < interval
-    ) {
-      return;
-    }
-
-    lastSignalChange = millis();
-    signalOn = !signalOn;
-
-    digitalWrite(
-      LED_PIN,
-      signalOn ? HIGH : LOW
-    );
-
-    digitalWrite(
-      BUZZER_PIN,
-      signalOn ? HIGH : LOW
-    );
-
-    return;
-  }
-
-  // With no active alarm, stale contact is shown by a quiet LED pulse. The
-  // sounder stays off because the hazard state itself is unknown.
-  if (stale) {
-    uint32_t interval =
-      signalOn
-        ? 120
-        : 1880;
-
-    if (
-      millis() - lastSignalChange
-      < interval
-    ) {
-      return;
-    }
-
-    lastSignalChange = millis();
-    signalOn = !signalOn;
-
-    digitalWrite(
-      LED_PIN,
-      signalOn ? HIGH : LOW
-    );
-
-    digitalWrite(
-      BUZZER_PIN,
-      LOW
-    );
-
-    return;
-  }
-
-  signalOn = false;
+  activePattern = steps;
+  patternLength = length;
+  patternIndex = 0;
+  patternLastChange = millis();
 
   digitalWrite(
     LED_PIN,
-    LOW
+    steps[0].led ? HIGH : LOW
   );
 
   digitalWrite(
     BUZZER_PIN,
-    LOW
+    steps[0].buzzer ? HIGH : LOW
+  );
+}
+
+
+void updateSignalling() {
+  if (
+    isGatewayStale() &&
+    !alarmActive()
+  ) {
+    setPattern(
+      PAT_STALE,
+      sizeof(PAT_STALE) / sizeof(Step)
+    );
+    return;
+  }
+
+  if (alarmActive()) {
+    if (
+      strcmp(
+        cmdHazard,
+        "FLOOD"
+      ) == 0
+    ) {
+      setPattern(
+        PAT_FLOOD,
+        sizeof(PAT_FLOOD) / sizeof(Step)
+      );
+    } else if (
+      strcmp(
+        cmdHazard,
+        "QUAKE"
+      ) == 0
+    ) {
+      setPattern(
+        PAT_QUAKE,
+        sizeof(PAT_QUAKE) / sizeof(Step)
+      );
+    } else if (
+      strcmp(
+        cmdHazard,
+        "FIRE"
+      ) == 0
+    ) {
+      setPattern(
+        PAT_FIRE,
+        sizeof(PAT_FIRE) / sizeof(Step)
+      );
+    } else {
+      setPattern(
+        PAT_MULTI,
+        sizeof(PAT_MULTI) / sizeof(Step)
+      );
+    }
+
+    return;
+  }
+
+  setPattern(
+    PAT_OFF,
+    sizeof(PAT_OFF) / sizeof(Step)
+  );
+}
+
+
+void servicePattern() {
+  if (!activePattern) {
+    return;
+  }
+
+  uint32_t currentTime =
+    millis();
+
+  if (
+    currentTime - patternLastChange <
+    activePattern[patternIndex].durationMs
+  ) {
+    return;
+  }
+
+  patternLastChange =
+    currentTime;
+
+  patternIndex =
+    (patternIndex + 1) %
+    patternLength;
+
+  digitalWrite(
+    LED_PIN,
+    activePattern[patternIndex].led
+      ? HIGH
+      : LOW
+  );
+
+  digitalWrite(
+    BUZZER_PIN,
+    activePattern[patternIndex].buzzer
+      ? HIGH
+      : LOW
   );
 }
 
@@ -647,6 +733,8 @@ void handleFrame(char *frame) {
     sizeof(cmdHazard)
   );
 
+  updateSignalling();
+
   if (
     IS_ACTUATOR &&
     newBarrier[0] &&
@@ -859,6 +947,7 @@ void setup() {
     "BOOT responder receiver"
   );
 
+  updateSignalling();
   drawStatus();
 }
 
@@ -885,7 +974,7 @@ void loop() {
     drawStatus();
   }
 
-  serviceBeaconSignal();
+  servicePattern();
 
   // A timeout happens without receiving a packet, so refresh the display when
   // the stale/not-stale state changes.
@@ -897,6 +986,7 @@ void loop() {
 
   if (staleNow != previousStale) {
     previousStale = staleNow;
+    updateSignalling();
     drawStatus();
   }
 }
