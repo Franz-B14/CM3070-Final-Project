@@ -3,7 +3,7 @@
 Basic operator dashboard for the SenseNode gateway.
 
 Reads the JSON state written by hub_live.py and serves a local web page
-showing system status, node readings, battery state and recent events.
+showing system status, node readings, responder state and recent events.
 """
 
 import json
@@ -15,6 +15,10 @@ STATE_FILE = "/dev/shm/ews_state.json"
 DEFAULT_STATE = {
     "status": "--",
     "hazard": "NONE",
+    "alarm": "OFF",
+    "barrier": "OPEN",
+    "barrier_commanded": "OPEN",
+    "barrier_confirmed": None,
     "updated": "-",
     "node_order": ["n1", "n2", "n3"],
     "nodes": {
@@ -25,7 +29,7 @@ DEFAULT_STATE = {
         "n3": {"live": False, "age": None, "battery": None,
                "battery_band": "-", "charge": "-", "readings": {}},
     },
-    "stats": {"accepted": 0, "rejected": 0},
+    "stats": {"accepted": 0, "rejected": 0, "commands_sent": 0},
     "log": [],
 }
 
@@ -157,6 +161,54 @@ PAGE = """<!doctype html>
       flex-wrap: wrap;
     }
 
+    .responder {
+      background: white;
+      border: 1px solid #ccc;
+      margin-top: 16px;
+      padding: 14px;
+    }
+
+    .responder h2 {
+      margin: 0 0 12px 0;
+      font-size: 18px;
+    }
+
+    .responder-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+    }
+
+    .responder-box {
+      border: 1px solid #ddd;
+      padding: 10px;
+    }
+
+    .responder-box span {
+      display: block;
+      color: #666;
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+
+    .responder-box strong {
+      font-size: 18px;
+    }
+
+    .barrier-closed,
+    .alarm-critical {
+      color: #c0392b;
+    }
+
+    .barrier-open,
+    .alarm-off {
+      color: #16865a;
+    }
+
+    .not-confirmed {
+      color: #777;
+    }
+
     .event-log {
       background: white;
       border: 1px solid #ccc;
@@ -221,6 +273,31 @@ PAGE = """<!doctype html>
 
   <div id="nodes" class="nodes"></div>
 
+  <div class="responder">
+    <h2>Responder state</h2>
+    <div class="responder-grid">
+      <div class="responder-box">
+        <span>Barrier commanded</span>
+        <strong id="barrierCommand">-</strong>
+      </div>
+
+      <div class="responder-box">
+        <span>Barrier confirmed</span>
+        <strong id="barrierConfirmed" class="not-confirmed">Not available</strong>
+      </div>
+
+      <div class="responder-box">
+        <span>Alarm</span>
+        <strong id="alarmState">-</strong>
+      </div>
+
+      <div class="responder-box">
+        <span>Responder commands sent</span>
+        <strong id="commandsSent">0</strong>
+      </div>
+    </div>
+  </div>
+
   <div class="stats">
     <div>Accepted packets: <strong id="accepted">0</strong></div>
     <div>Rejected packets: <strong id="rejected">0</strong></div>
@@ -254,6 +331,37 @@ function batteryClass(band) {
   return "";
 }
 
+function updateResponder(state) {
+  var barrier = state.barrier_commanded || state.barrier || "-";
+  var alarm = state.alarm || "-";
+  var confirmed = state.barrier_confirmed;
+
+  var barrierElement = document.getElementById("barrierCommand");
+  barrierElement.textContent = barrier;
+  barrierElement.className =
+    barrier === "CLOSED" ? "barrier-closed" : "barrier-open";
+
+  var confirmedElement = document.getElementById("barrierConfirmed");
+
+  if (confirmed === null || confirmed === undefined) {
+    confirmedElement.textContent = "Not available";
+    confirmedElement.className = "not-confirmed";
+  } else {
+    confirmedElement.textContent = confirmed;
+    confirmedElement.className =
+      confirmed === "CLOSED" ? "barrier-closed" : "barrier-open";
+  }
+
+  var alarmElement = document.getElementById("alarmState");
+  alarmElement.textContent = alarm;
+  alarmElement.className =
+    alarm === "OFF" ? "alarm-off" : "alarm-critical";
+
+  var stats = state.stats || {};
+  document.getElementById("commandsSent").textContent =
+    stats.commands_sent || 0;
+}
+
 function updateDashboard(state) {
   document.getElementById("updated").textContent =
     valueOrDash(state.updated);
@@ -263,6 +371,8 @@ function updateDashboard(state) {
 
   document.getElementById("hazard").textContent =
     valueOrDash(state.hazard);
+
+  updateResponder(state);
 
   var system = document.getElementById("system");
   system.className = "status";
