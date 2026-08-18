@@ -6,7 +6,8 @@
  * MPU6050 readings to detect unusual ground movement. It also uses
  * temperature and humidity to identify possible fire-weather conditions.
  * LoRa messages include a node ID, sequence number and HMAC signature.
- * This version also measures the board battery voltage.
+ * This version also measures the board battery voltage and uses a
+ * scheduled LoRa heartbeat with faster sends when a hazard changes.
  */
 
 #include <Wire.h>
@@ -48,6 +49,8 @@ const char* HMAC_KEY = "REPLACE_WITH_NODE_SECRET_KEY";
 #define LORA_RST 23
 #define LORA_DIO0 26
 #define LORA_BAND 868E6
+#define LORA_SYNC_WORD 0x12
+#define LORA_TX_POWER_DBM 14
 
 const int SOIL_WET_THRESHOLD = 1250;
 
@@ -80,6 +83,23 @@ bool quakeDetected = false;
 unsigned long quakeHoldUntil = 0;
 unsigned long sequenceNumber = 0;
 
+// Each node gets a different 10 second position in the 30 second cycle.
+// n1 = 0 seconds, n2 = 10 seconds and n3 = 20 seconds.
+const int NODE_INDEX = NODE_ID[1] - '1';
+
+const unsigned long HEARTBEAT_MS = 30000;
+const unsigned long NODE_SLOT_MS = 10000;
+const unsigned long TX_JITTER_MS = 1000;
+const unsigned long MIN_TX_GAP_MS = 5000;
+
+unsigned long lastTransmission = 0;
+unsigned long nextHeartbeat = 0;
+
+bool previousFlood = false;
+bool previousQuake = false;
+bool previousFire = false;
+bool firstTransmissionDone = false;
+
 Adafruit_BME280 bme;
 Adafruit_MPU6050 mpu;
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
@@ -88,6 +108,15 @@ bool bmeFound = false;
 bool mpuFound = false;
 bool displayFound = false;
 bool loraFound = false;
+
+void scheduleNextHeartbeat(unsigned long currentTime) {
+  long jitter = random(
+    -(long)TX_JITTER_MS,
+    (long)TX_JITTER_MS + 1
+  );
+
+  nextHeartbeat = currentTime + HEARTBEAT_MS + jitter;
+}
 
 float readBatteryVoltage() {
   unsigned long totalMillivolts = 0;
@@ -184,9 +213,22 @@ void setup() {
 
   if (LoRa.begin(LORA_BAND)) {
     loraFound = true;
-    LoRa.setSyncWord(0x12);
+    LoRa.setSyncWord(LORA_SYNC_WORD);
+    LoRa.setSpreadingFactor(7);
+    LoRa.setSignalBandwidth(125E3);
+    LoRa.setCodingRate4(5);
     LoRa.enableCrc();
-    Serial.println("LoRa radio ready");
+    LoRa.setTxPower(LORA_TX_POWER_DBM);
+
+    // Give every node a slightly different random sequence after reboot.
+    randomSeed(esp_random());
+
+    // Start each node in a different part of the 30 second cycle.
+    nextHeartbeat =
+      millis() + ((unsigned long)NODE_INDEX * NODE_SLOT_MS);
+
+    Serial.print("LoRa ready for ");
+    Serial.println(NODE_ID);
   } else {
     Serial.println("LoRa radio not found");
   }
@@ -331,28 +373,50 @@ void loop() {
   }
 
   if (loraFound) {
-    sequenceNumber++;
+    bool hazardChanged =
+      (floodDetected != previousFlood) ||
+      (quakeDetected != previousQuake) ||
+      (fireDetected != previousFire);
 
-    String payload = "node=" + String(NODE_ID);
-    payload += ",status=" + String(floodDetected ? "FLOOD" : "OK");
-    payload += ",seq=" + String(sequenceNumber);
-    payload += ",t=" + String(temperature, 1);
-    payload += ",h=" + String(humidity, 1);
-    payload += ",p=" + String(pressure, 1);
-    payload += ",soil=" + String(soilValue);
-    payload += ",btn=" + String(buttonPressed ? 1 : 0);
-    payload += ",quake=" + String(quakeDetected ? "QUAKE" : "OK");
-    payload += ",fire=" + String(fireDetected ? "FIRE" : "OK");
-    payload += ",vbat=" + String(batteryVoltage, 2);
+    bool eventSend =
+      hazardChanged &&
+      (now - lastTransmission >= MIN_TX_GAP_MS);
 
-    String signature = hmacSha256Hex(HMAC_KEY, payload.c_str());
-    String signedMessage = payload + "|" + signature;
+    bool heartbeatDue =
+      (long)(now - nextHeartbeat) >= 0;
 
-    LoRa.beginPacket();
-    LoRa.print(signedMessage);
-    LoRa.endPacket();
+    if (eventSend || heartbeatDue || !firstTransmissionDone) {
+      sequenceNumber++;
 
-    Serial.print("LoRa TX: ");
-    Serial.println(signedMessage);
+      String payload = "node=" + String(NODE_ID);
+      payload += ",status=" + String(floodDetected ? "FLOOD" : "OK");
+      payload += ",seq=" + String(sequenceNumber);
+      payload += ",t=" + String(temperature, 1);
+      payload += ",h=" + String(humidity, 1);
+      payload += ",p=" + String(pressure, 1);
+      payload += ",soil=" + String(soilValue);
+      payload += ",btn=" + String(buttonPressed ? 1 : 0);
+      payload += ",quake=" + String(quakeDetected ? "QUAKE" : "OK");
+      payload += ",fire=" + String(fireDetected ? "FIRE" : "OK");
+      payload += ",vbat=" + String(batteryVoltage, 2);
+
+      String signature = hmacSha256Hex(HMAC_KEY, payload.c_str());
+      String signedMessage = payload + "|" + signature;
+
+      LoRa.beginPacket();
+      LoRa.print(signedMessage);
+      LoRa.endPacket();
+
+      Serial.print(eventSend ? "LoRa EVENT: " : "LoRa HEARTBEAT: ");
+      Serial.println(signedMessage);
+
+      lastTransmission = now;
+      previousFlood = floodDetected;
+      previousQuake = quakeDetected;
+      previousFire = fireDetected;
+      firstTransmissionDone = true;
+
+      scheduleNextHeartbeat(now);
+    }
   }
 }
