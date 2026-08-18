@@ -31,9 +31,9 @@ NODE_KEYS = {
 NODE_ORDER = ["n1", "n2", "n3"]
 HEARTBEAT_TIMEOUT_S = 90.0
 
-# Placeholder used for signed gateway-to-responder commands.
-GATEWAY_KEY = b"REPLACE_WITH_GATEWAY_SECRET_KEY"
-
+# Downlink secrets are kept outside the repository. The Raspberry Pi uses a
+# local key file that should be readable only by the account running the hub.
+KEYS_PATH = os.path.expanduser("~/ews/node_keys.txt")
 GW_SEQ_PATH = os.path.expanduser("~/ews/gw_seq")
 COMMAND_HEARTBEAT_S = 30.0
 COMMAND_MIN_GAP_S = 5.0
@@ -304,6 +304,52 @@ def responder_state(snapshot):
         alarm,
         hazard
     )
+
+
+def load_gateway_key(path=KEYS_PATH):
+    """
+    Read the responder downlink key from the local gateway key file.
+
+    Expected line format:
+        gw=<secret>
+
+    Blank lines and comments beginning with # are ignored.
+    """
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"Gateway key file not found: {path}"
+        )
+
+    with open(path, encoding="utf-8") as file:
+        for raw_line in file:
+            line = raw_line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            for separator in ("=", ":", " ", "\t"):
+                if separator not in line:
+                    continue
+
+                name, value = line.split(
+                    separator,
+                    1
+                )
+
+                if (
+                    name.strip().lower() == "gw"
+                    and value.strip()
+                ):
+                    return value.strip().encode()
+
+                break
+
+    raise SystemExit(
+        f"No 'gw' key found in {path}"
+    )
+
+
+GATEWAY_KEY = load_gateway_key()
 
 
 def next_gateway_sequence():
