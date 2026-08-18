@@ -8,8 +8,25 @@ showing system status, node readings, responder state and recent events.
 
 import json
 import os
+import sys
 
 from flask import Flask, Response, send_from_directory
+
+# In the repository the dashboard and gateway are separate folders. Add the
+# gateway folder so this file can still import the shared CAP site table when
+# run directly from Dashboard/.
+GATEWAY_DIR = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "Gateway"
+    )
+)
+
+if GATEWAY_DIR not in sys.path:
+    sys.path.insert(0, GATEWAY_DIR)
+
+import cap
 
 STATE_FILE = "/dev/shm/ews_state.json"
 CAP_DIR = os.path.expanduser("~/ews/cap")
@@ -303,6 +320,103 @@ PAGE = """<!doctype html>
       color: #34515e;
     }
 
+    .map-wrap {
+      margin-top: 16px;
+    }
+
+    .map-title {
+      font-size: 18px;
+      font-weight: bold;
+      margin-bottom: 8px;
+    }
+
+    .map-box {
+      background: white;
+      border: 1px solid #ccc;
+      padding: 10px 14px 6px;
+    }
+
+    #corridorMap {
+      width: 100%;
+      display: block;
+    }
+
+    #corridorMap text {
+      font-family: monospace;
+      fill: #666;
+    }
+
+    #corridorMap text.node-name {
+      fill: #222;
+      font-weight: bold;
+      font-size: 12px;
+    }
+
+    #corridorMap text.node-place {
+      font-size: 10px;
+    }
+
+    #corridorMap text.distance {
+      font-size: 10px;
+    }
+
+    #corridorMap .axis {
+      stroke: #d1d5d8;
+      stroke-width: 6;
+      stroke-linecap: round;
+    }
+
+    #corridorMap .tick {
+      stroke: #777;
+      stroke-width: 1;
+    }
+
+    .map-key {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+      font-size: 12px;
+      color: #666;
+    }
+
+    .map-key span::before {
+      content: "";
+      display: inline-block;
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      margin-right: 5px;
+      vertical-align: middle;
+      border: 1px solid white;
+    }
+
+    .map-key .map-live::before {
+      background: #16865a;
+    }
+
+    .map-key .map-hazard::before {
+      background: #c0392b;
+    }
+
+    .map-key .map-lost::before {
+      background: #777;
+    }
+
+    .map-key .map-held::before {
+      background: #777;
+      border: 2px solid #c0392b;
+      width: 11px;
+      height: 11px;
+    }
+
+    .map-note {
+      margin-top: 5px;
+      color: #666;
+      font-size: 11px;
+      line-height: 1.5;
+    }
+
     .responder {
       background: white;
       border: 1px solid #ccc;
@@ -484,6 +598,28 @@ PAGE = """<!doctype html>
     </div>
   </div>
 
+  <div class="map-wrap">
+    <div class="map-title">Deployment: Birkirkara to Msida flood corridor</div>
+
+    <div class="map-box">
+      <svg id="corridorMap"
+           viewBox="0 0 960 210"
+           preserveAspectRatio="xMidYMid meet"></svg>
+    </div>
+
+    <div class="map-key">
+      <span class="map-live">SenseNode normal</span>
+      <span class="map-hazard">SenseNode hazard</span>
+      <span class="map-lost">No contact</span>
+      <span class="map-held">Silent, hazard held</span>
+    </div>
+
+    <div class="map-note">
+      SenseNode positions are plotted from the same site coordinates used by
+      CAP alert areas. This is an offline schematic, not a street map.
+    </div>
+  </div>
+
   <div id="responderPanel" class="responder">
     <h2>Responder state</h2>
     <div class="responder-grid">
@@ -618,6 +754,334 @@ function updateCorroboration(state) {
   box.innerHTML = html;
 }
 
+var SVG_NS = "http://www.w3.org/2000/svg";
+var siteMarkers = {};
+var corridorSites = null;
+
+function svgElement(tag, attributes, text) {
+  var item = document.createElementNS(SVG_NS, tag);
+
+  Object.keys(attributes || {}).forEach(function(name) {
+    item.setAttribute(name, attributes[name]);
+  });
+
+  if (text !== undefined) {
+    item.textContent = text;
+  }
+
+  return item;
+}
+
+function distanceMetres(a, b) {
+  var radius = 6371000;
+  var toRadians = Math.PI / 180;
+
+  var lat1 = a.lat * toRadians;
+  var lat2 = b.lat * toRadians;
+  var deltaLat = (b.lat - a.lat) * toRadians;
+  var deltaLon = (b.lon - a.lon) * toRadians;
+
+  var value =
+    Math.sin(deltaLat / 2) * Math.sin(deltaLat / 2) +
+    Math.cos(lat1) * Math.cos(lat2) *
+    Math.sin(deltaLon / 2) * Math.sin(deltaLon / 2);
+
+  return 2 * radius *
+    Math.atan2(Math.sqrt(value), Math.sqrt(1 - value));
+}
+
+function shortSiteName(description) {
+  var text = String(description || "");
+  var parts = text.split("—");
+
+  if (parts.length === 1) {
+    parts = text.split(" - ");
+  }
+
+  return (
+    parts[parts.length - 1] ||
+    text ||
+    ""
+  ).trim();
+}
+
+function drawCorridorMap(sites) {
+  corridorSites = sites;
+
+  var svg = document.getElementById("corridorMap");
+  svg.innerHTML = "";
+  siteMarkers = {};
+
+  var ids = Object.keys(sites).filter(function(id) {
+    return sites[id].cls === "sense";
+  });
+
+  if (ids.length === 0) {
+    return;
+  }
+
+  // West to east is approximately upstream Birkirkara to downstream Msida.
+  ids.sort(function(a, b) {
+    return sites[a].lon - sites[b].lon;
+  });
+
+  var width = 960;
+  var height = 210;
+  var padding = 100;
+  var middleY = 105;
+
+  var latitudes = ids.map(function(id) {
+    return sites[id].lat;
+  });
+
+  var longitudes = ids.map(function(id) {
+    return sites[id].lon;
+  });
+
+  var centreLat =
+    (Math.min.apply(null, latitudes) +
+     Math.max.apply(null, latitudes)) / 2;
+
+  var lonScale =
+    Math.cos(centreLat * Math.PI / 180);
+
+  var projectedX = ids.map(function(id) {
+    return sites[id].lon * lonScale;
+  });
+
+  var minX = Math.min.apply(null, projectedX);
+  var maxX = Math.max.apply(null, projectedX);
+  var span = (maxX - minX) || 0.000001;
+  var scale = (width - 2 * padding) / span;
+
+  function x(site) {
+    return padding +
+      (site.lon * lonScale - minX) * scale;
+  }
+
+  function y(site) {
+    return middleY -
+      (site.lat - centreLat) * scale;
+  }
+
+  // Valley axis through the three SenseNodes.
+  if (ids.length > 1) {
+    var path = "M " +
+      x(sites[ids[0]]) + " " +
+      y(sites[ids[0]]);
+
+    for (var index = 1; index < ids.length; index++) {
+      path += " L " +
+        x(sites[ids[index]]) + " " +
+        y(sites[ids[index]]);
+    }
+
+    svg.appendChild(
+      svgElement(
+        "path",
+        {
+          d: path,
+          class: "axis",
+          fill: "none"
+        }
+      )
+    );
+  }
+
+  svg.appendChild(
+    svgElement(
+      "text",
+      {
+        x: padding,
+        y: 22,
+        "text-anchor": "start"
+      },
+      "upstream: Birkirkara"
+    )
+  );
+
+  svg.appendChild(
+    svgElement(
+      "text",
+      {
+        x: width - padding,
+        y: 22,
+        "text-anchor": "end"
+      },
+      "downstream: Msida Creek →"
+    )
+  );
+
+  // Show measured spacing between consecutive nodes.
+  for (var gap = 0; gap < ids.length - 1; gap++) {
+    var first = sites[ids[gap]];
+    var second = sites[ids[gap + 1]];
+    var metres = distanceMetres(first, second);
+
+    svg.appendChild(
+      svgElement(
+        "text",
+        {
+          x: (x(first) + x(second)) / 2,
+          y: middleY - 22,
+          class: "distance",
+          "text-anchor": "middle"
+        },
+        (metres / 1000).toFixed(2) + " km"
+      )
+    );
+  }
+
+  ids.forEach(function(id) {
+    var site = sites[id];
+    var px = x(site);
+    var py = y(site);
+
+    var circle = svgElement(
+      "circle",
+      {
+        cx: px,
+        cy: py,
+        r: 9,
+        fill: "#777",
+        stroke: "#fff",
+        "stroke-width": 2
+      }
+    );
+
+    svg.appendChild(circle);
+
+    svg.appendChild(
+      svgElement(
+        "text",
+        {
+          x: px,
+          y: py - 20,
+          class: "node-name",
+          "text-anchor": "middle"
+        },
+        id.toUpperCase()
+      )
+    );
+
+    svg.appendChild(
+      svgElement(
+        "text",
+        {
+          x: px,
+          y: py + 27,
+          class: "node-place",
+          "text-anchor": "middle"
+        },
+        shortSiteName(site.desc)
+      )
+    );
+
+    siteMarkers[id] = circle;
+  });
+
+  // 500 m scale bar.
+  var referenceA = {
+    lat: centreLat,
+    lon: 0
+  };
+
+  var referenceB = {
+    lat: centreLat,
+    lon: 1
+  };
+
+  var metresPerDegree =
+    distanceMetres(referenceA, referenceB);
+
+  var scaleBarPixels =
+    (500 / metresPerDegree) *
+    lonScale *
+    scale;
+
+  var barX = padding;
+  var barY = height - 15;
+
+  svg.appendChild(
+    svgElement(
+      "line",
+      {
+        x1: barX,
+        y1: barY,
+        x2: barX + scaleBarPixels,
+        y2: barY,
+        class: "tick"
+      }
+    )
+  );
+
+  svg.appendChild(
+    svgElement(
+      "text",
+      {
+        x: barX + scaleBarPixels + 8,
+        y: barY + 4
+      },
+      "500 m"
+    )
+  );
+}
+
+function updateCorridorMap(state) {
+  if (!corridorSites) {
+    return;
+  }
+
+  var nodes = state.nodes || {};
+  var snapshot = state.corroboration || {};
+  var heldNodes = {};
+
+  Object.keys(snapshot).forEach(function(hazard) {
+    (snapshot[hazard].held || []).forEach(function(nodeId) {
+      heldNodes[nodeId] = true;
+    });
+  });
+
+  Object.keys(siteMarkers).forEach(function(nodeId) {
+    var marker = siteMarkers[nodeId];
+    var node = nodes[nodeId];
+
+    var fill = "#777";
+    var stroke = "#fff";
+    var strokeWidth = 2;
+
+    if (node && node.live) {
+      var readings = node.readings || {};
+
+      var hazard =
+        readings.status === "FLOOD" ||
+        (readings.quake && readings.quake !== "OK") ||
+        (readings.fire && readings.fire !== "OK");
+
+      fill = hazard ? "#c0392b" : "#16865a";
+    } else if (heldNodes[nodeId]) {
+      fill = "#777";
+      stroke = "#c0392b";
+      strokeWidth = 3;
+    }
+
+    marker.setAttribute("fill", fill);
+    marker.setAttribute("stroke", stroke);
+    marker.setAttribute("stroke-width", strokeWidth);
+  });
+}
+
+function loadCorridorSites() {
+  fetch("/api/sites")
+    .then(function(response) {
+      return response.json();
+    })
+    .then(drawCorridorMap)
+    .catch(function(error) {
+      console.log("Could not load corridor sites:", error);
+    });
+}
+
 function updateCap(state) {
   var cap = state.cap;
   var panel = document.getElementById("capPanel");
@@ -715,6 +1179,7 @@ function updateDashboard(state) {
   updateResponder(state);
   updateCorroboration(state);
   updateCap(state);
+  updateCorridorMap(state);
 
   var system = document.getElementById("system");
   system.className = "status";
@@ -813,6 +1278,7 @@ function refresh() {
 }
 
 setInterval(refresh, 1000);
+loadCorridorSites();
 refresh();
 </script>
 </body>
@@ -835,6 +1301,31 @@ def api_state():
             json.dumps(DEFAULT_STATE),
             mimetype="application/json"
         )
+
+
+@app.route("/api/sites")
+def api_sites():
+    """Return SenseNode positions from the same site table used by CAP."""
+    sites = {}
+
+    for node_id, site in cap.SITES.items():
+        # This first schematic shows the three sensing locations only.
+        site_class = site.get("class", "sense")
+
+        if site_class != "sense":
+            continue
+
+        sites[node_id] = {
+            "cls": "sense",
+            "desc": site["desc"],
+            "lat": site["lat"],
+            "lon": site["lon"],
+        }
+
+    return Response(
+        json.dumps(sites),
+        mimetype="application/json"
+    )
 
 
 @app.route("/cap/latest.xml")
