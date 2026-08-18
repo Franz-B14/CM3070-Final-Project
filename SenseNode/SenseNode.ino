@@ -2,7 +2,8 @@
  * SenseNode - Node 1
  *
  * Reads the environmental sensors and checks for a possible flood.
- * This version also sends the current readings to the gateway using LoRa.
+ * Sends the current readings to the gateway using LoRa and reads movement
+ * from an MPU6050 for later earthquake detection.
  */
 
 #include <Wire.h>
@@ -10,6 +11,7 @@
 #include <LoRa.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
+#include <Adafruit_MPU6050.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
@@ -34,9 +36,11 @@
 const int SOIL_WET_THRESHOLD = 1250;
 
 Adafruit_BME280 bme;
+Adafruit_MPU6050 mpu;
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 
 bool bmeFound = false;
+bool mpuFound = false;
 bool displayFound = false;
 bool loraFound = false;
 
@@ -67,6 +71,17 @@ void setup() {
     Serial.println("BME280 not found");
   }
 
+  // The MPU6050 is used to measure movement of the node.
+  if (mpu.begin()) {
+    mpuFound = true;
+    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    Serial.println("MPU6050 connected");
+  } else {
+    Serial.println("MPU6050 not found");
+  }
+
   // Set up the LoRa radio using the board's SPI pins.
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
   LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
@@ -95,6 +110,26 @@ void loop() {
   int soilValue = analogRead(SOIL_PIN);
   bool buttonPressed = (digitalRead(BTN_PIN) == LOW);
 
+  float accelX = 0.0;
+  float accelY = 0.0;
+  float accelZ = 0.0;
+  float accelMagnitude = 0.0;
+
+  if (mpuFound) {
+    sensors_event_t acceleration, gyro, mpuTemperature;
+    mpu.getEvent(&acceleration, &gyro, &mpuTemperature);
+
+    accelX = acceleration.acceleration.x;
+    accelY = acceleration.acceleration.y;
+    accelZ = acceleration.acceleration.z;
+
+    accelMagnitude = sqrt(
+      accelX * accelX +
+      accelY * accelY +
+      accelZ * accelZ
+    );
+  }
+
   // A low soil sensor reading means the sensor is wet.
   bool soilWet = (soilValue < SOIL_WET_THRESHOLD);
   bool floodDetected = soilWet || buttonPressed;
@@ -111,6 +146,17 @@ void loop() {
   Serial.print(buttonPressed ? "PRESSED" : "RELEASED");
   Serial.print(", Flood: ");
   Serial.println(floodDetected ? "FLOOD" : "OK");
+
+  if (mpuFound) {
+    Serial.print("Acceleration X: ");
+    Serial.print(accelX, 2);
+    Serial.print(", Y: ");
+    Serial.print(accelY, 2);
+    Serial.print(", Z: ");
+    Serial.print(accelZ, 2);
+    Serial.print(", Magnitude: ");
+    Serial.println(accelMagnitude, 2);
+  }
 
   if (displayFound) {
     display.clearDisplay();
