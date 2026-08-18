@@ -2,8 +2,8 @@
  * SenseNode - Node 1
  *
  * Reads the environmental sensors and checks for a possible flood.
- * Sends the current readings to the gateway using LoRa and reads movement
- * from an MPU6050 for later earthquake detection.
+ * Sends the current readings to the gateway using LoRa and uses the
+ * MPU6050 readings to detect unusual ground movement.
  */
 
 #include <Wire.h>
@@ -34,6 +34,27 @@
 #define LORA_BAND 868E6
 
 const int SOIL_WET_THRESHOLD = 1250;
+
+// Earthquake detection uses a short-term and long-term average of movement.
+const int SAMPLE_RATE_HZ = 100;
+const int STA_SAMPLES = 40;       // 0.4 seconds
+const int LTA_SAMPLES = 500;      // 5 seconds
+const float QUAKE_RATIO_THRESHOLD = 3.5;
+const float GRAVITY_BASELINE = 9.82;
+
+const unsigned long ACCEL_INTERVAL_MS = 1000UL / SAMPLE_RATE_HZ;
+const unsigned long SENSOR_INTERVAL_MS = 1000;
+
+float staBuffer[STA_SAMPLES] = {0};
+float ltaBuffer[LTA_SAMPLES] = {0};
+int staIndex = 0;
+int ltaIndex = 0;
+float staSum = 0.0;
+float ltaSum = 0.0;
+unsigned long accelSampleCount = 0;
+unsigned long lastAccelSample = 0;
+unsigned long lastSensorRead = 0;
+bool quakeDetected = false;
 
 Adafruit_BME280 bme;
 Adafruit_MPU6050 mpu;
@@ -96,7 +117,69 @@ void setup() {
   }
 }
 
+
+void updateEarthquakeDetection(float magnitude) {
+  // Remove the normal effect of gravity so that only movement is compared.
+  float movement = fabs(magnitude - GRAVITY_BASELINE);
+
+  staSum -= staBuffer[staIndex];
+  staBuffer[staIndex] = movement;
+  staSum += movement;
+  staIndex = (staIndex + 1) % STA_SAMPLES;
+
+  ltaSum -= ltaBuffer[ltaIndex];
+  ltaBuffer[ltaIndex] = movement;
+  ltaSum += movement;
+  ltaIndex = (ltaIndex + 1) % LTA_SAMPLES;
+
+  accelSampleCount++;
+
+  // Wait until the long-term window contains enough readings.
+  if (accelSampleCount < LTA_SAMPLES) {
+    quakeDetected = false;
+    return;
+  }
+
+  float staAverage = staSum / STA_SAMPLES;
+  float ltaAverage = ltaSum / LTA_SAMPLES;
+
+  if (ltaAverage > 0.0) {
+    float ratio = staAverage / ltaAverage;
+    quakeDetected = (ratio >= QUAKE_RATIO_THRESHOLD);
+  } else {
+    quakeDetected = false;
+  }
+}
+
 void loop() {
+  unsigned long now = millis();
+
+  // Sample the accelerometer at about 100 Hz.
+  if (mpuFound && (now - lastAccelSample >= ACCEL_INTERVAL_MS)) {
+    lastAccelSample = now;
+
+    sensors_event_t acceleration, gyro, mpuTemperature;
+    mpu.getEvent(&acceleration, &gyro, &mpuTemperature);
+
+    float accelX = acceleration.acceleration.x;
+    float accelY = acceleration.acceleration.y;
+    float accelZ = acceleration.acceleration.z;
+
+    float accelMagnitude = sqrt(
+      accelX * accelX +
+      accelY * accelY +
+      accelZ * accelZ
+    );
+
+    updateEarthquakeDetection(accelMagnitude);
+  }
+
+  // The environmental sensors and LoRa message only need updating once a second.
+  if (now - lastSensorRead < SENSOR_INTERVAL_MS) {
+    return;
+  }
+  lastSensorRead = now;
+
   float temperature = 0.0;
   float humidity = 0.0;
   float pressure = 0.0;
@@ -110,27 +193,6 @@ void loop() {
   int soilValue = analogRead(SOIL_PIN);
   bool buttonPressed = (digitalRead(BTN_PIN) == LOW);
 
-  float accelX = 0.0;
-  float accelY = 0.0;
-  float accelZ = 0.0;
-  float accelMagnitude = 0.0;
-
-  if (mpuFound) {
-    sensors_event_t acceleration, gyro, mpuTemperature;
-    mpu.getEvent(&acceleration, &gyro, &mpuTemperature);
-
-    accelX = acceleration.acceleration.x;
-    accelY = acceleration.acceleration.y;
-    accelZ = acceleration.acceleration.z;
-
-    accelMagnitude = sqrt(
-      accelX * accelX +
-      accelY * accelY +
-      accelZ * accelZ
-    );
-  }
-
-  // A low soil sensor reading means the sensor is wet.
   bool soilWet = (soilValue < SOIL_WET_THRESHOLD);
   bool floodDetected = soilWet || buttonPressed;
 
@@ -142,21 +204,10 @@ void loop() {
   Serial.print(pressure, 1);
   Serial.print(" hPa, Soil: ");
   Serial.print(soilValue);
-  Serial.print(", Button: ");
-  Serial.print(buttonPressed ? "PRESSED" : "RELEASED");
   Serial.print(", Flood: ");
-  Serial.println(floodDetected ? "FLOOD" : "OK");
-
-  if (mpuFound) {
-    Serial.print("Acceleration X: ");
-    Serial.print(accelX, 2);
-    Serial.print(", Y: ");
-    Serial.print(accelY, 2);
-    Serial.print(", Z: ");
-    Serial.print(accelZ, 2);
-    Serial.print(", Magnitude: ");
-    Serial.println(accelMagnitude, 2);
-  }
+  Serial.print(floodDetected ? "FLOOD" : "OK");
+  Serial.print(", Quake: ");
+  Serial.println(quakeDetected ? "QUAKE" : "OK");
 
   if (displayFound) {
     display.clearDisplay();
@@ -170,26 +221,22 @@ void loop() {
     display.print("Hum:  ");
     display.print(humidity, 1);
     display.println(" %");
-    display.print("Pres: ");
-    display.print(pressure, 0);
-    display.println(" hPa");
     display.print("Soil: ");
     display.println(soilValue);
-    display.print("Button: ");
-    display.println(buttonPressed ? "ON" : "OFF");
-
-    display.setTextSize(2);
-    display.println(floodDetected ? "FLOOD" : "OK");
+    display.print("Flood: ");
+    display.println(floodDetected ? "YES" : "NO");
+    display.print("Quake: ");
+    display.println(quakeDetected ? "YES" : "NO");
     display.display();
   }
 
   if (loraFound) {
-    // Create a basic message containing the current sensor readings.
     String payload = "temp=" + String(temperature, 1);
     payload += ",hum=" + String(humidity, 1);
     payload += ",pressure=" + String(pressure, 1);
     payload += ",soil=" + String(soilValue);
     payload += ",flood=" + String(floodDetected ? "FLOOD" : "OK");
+    payload += ",quake=" + String(quakeDetected ? "QUAKE" : "OK");
 
     LoRa.beginPacket();
     LoRa.print(payload);
@@ -198,6 +245,4 @@ void loop() {
     Serial.print("LoRa TX: ");
     Serial.println(payload);
   }
-
-  delay(1000);
 }
