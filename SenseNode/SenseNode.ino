@@ -1,9 +1,9 @@
 /*
  * SenseNode - Node 1
  *
- * Initial version used to test the environmental sensors and display.
- * The node reads temperature, humidity, pressure, soil moisture and the
- * manual push button. Readings are shown on the OLED and Serial Monitor.
+ * Reads the BME280 and soil sensor and shows the values on the OLED.
+ * This version adds a simple flood check using the soil reading. The
+ * push button can also be used to trigger a flood condition during tests.
  */
 
 #include <Wire.h>
@@ -20,6 +20,8 @@
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
 #define OLED_ADDRESS 0x3C
+
+const int SOIL_WET_THRESHOLD = 1250;
 
 Adafruit_BME280 bme;
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
@@ -69,6 +71,10 @@ void loop() {
   int soilValue = analogRead(SOIL_PIN);
   bool buttonPressed = (digitalRead(BTN_PIN) == LOW);
 
+  // A low soil sensor reading means the sensor is wet.
+  bool soilWet = (soilValue < SOIL_WET_THRESHOLD);
+  bool floodDetected = soilWet || buttonPressed;
+
   Serial.print("Temperature: ");
   Serial.print(temperature, 1);
   Serial.print(" C, Humidity: ");
@@ -78,7 +84,9 @@ void loop() {
   Serial.print(" hPa, Soil: ");
   Serial.print(soilValue);
   Serial.print(", Button: ");
-  Serial.println(buttonPressed ? "PRESSED" : "RELEASED");
+  Serial.print(buttonPressed ? "PRESSED" : "RELEASED");
+  Serial.print(", Flood: ");
+  Serial.println(floodDetected ? "FLOOD" : "OK");
 
   if (displayFound) {
     display.clearDisplay();
@@ -99,6 +107,9 @@ void loop() {
     display.println(soilValue);
     display.print("Button: ");
     display.println(buttonPressed ? "ON" : "OFF");
+
+    display.setTextSize(2);
+    display.println(floodDetected ? "FLOOD" : "OK");
     display.display();
   }
 
