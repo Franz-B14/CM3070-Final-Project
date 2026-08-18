@@ -1,14 +1,14 @@
 /*
   sketch_C_responder.ino
-  Stage C2 - barrier actuator role
+  Stage C3 - persistent barrier state
 
   Receives gateway command frames over LoRa and verifies:
     - sender is the gateway
     - HMAC-SHA256 signature
     - monotonically increasing sequence number
 
-  This revision adds the a1 barrier actuator role. An authenticated
-  barrier command moves the servo only when the requested state changes.
+  This revision stores the last authenticated barrier state in ESP32
+  Preferences and restores it on boot before normal LoRa command handling.
   Public-beacon behaviour is added in a later revision.
 */
 
@@ -18,6 +18,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <ESP32Servo.h>
+#include <Preferences.h>
 #include "mbedtls/md.h"
 
 // ---------------------------------------------------------------------------
@@ -35,6 +36,7 @@
 #define SERVO_TRAVEL_MS   700
 
 Servo barrierServo;
+Preferences preferences;
 
 static const char *KEY_GW =
   "REPLACE_WITH_GATEWAY_SECRET_KEY";
@@ -289,6 +291,25 @@ void moveBarrier(const char *state) {
 }
 
 
+void persistBarrier(const char *state) {
+  if (!IS_ACTUATOR) {
+    return;
+  }
+
+  preferences.begin(
+    "ews",
+    false
+  );
+
+  preferences.putString(
+    "barrier",
+    state
+  );
+
+  preferences.end();
+}
+
+
 // ---------------------------------------------------------------------------
 // Signed command handling
 // ---------------------------------------------------------------------------
@@ -411,6 +432,7 @@ void handleFrame(char *frame) {
     ] = '\0';
 
     moveBarrier(cmdBarrier);
+    persistBarrier(cmdBarrier);
   }
 
   acceptCount++;
@@ -488,6 +510,38 @@ void setup() {
 
   display.clearDisplay();
   display.display();
+
+  if (IS_ACTUATOR) {
+    preferences.begin(
+      "ews",
+      true
+    );
+
+    String storedBarrier =
+      preferences.getString(
+        "barrier",
+        "OPEN"
+      );
+
+    preferences.end();
+
+    strncpy(
+      cmdBarrier,
+      storedBarrier.c_str(),
+      sizeof(cmdBarrier) - 1
+    );
+
+    cmdBarrier[
+      sizeof(cmdBarrier) - 1
+    ] = '\0';
+
+    Serial.print(
+      "BOOT restored barrier="
+    );
+    Serial.println(cmdBarrier);
+
+    moveBarrier(cmdBarrier);
+  }
 
   SPI.begin(
     LORA_SCK,
