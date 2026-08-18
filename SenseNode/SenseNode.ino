@@ -5,16 +5,25 @@
  * Sends the current readings to the gateway using LoRa and uses the
  * MPU6050 readings to detect unusual ground movement. It also uses
  * temperature and humidity to identify possible fire-weather conditions.
+ * LoRa messages now include a node ID, sequence number and HMAC signature.
  */
 
 #include <Wire.h>
 #include <SPI.h>
 #include <LoRa.h>
+#include "mbedtls/md.h"
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+
+// Node settings
+#define NODE_ID "n1"
+
+// Placeholder key for the repository version.
+// A different secret key should be used on each deployed node.
+const char* HMAC_KEY = "REPLACE_WITH_NODE_SECRET_KEY";
 
 #define SDA_PIN 21
 #define SCL_PIN 22
@@ -63,6 +72,7 @@ unsigned long lastAccelSample = 0;
 unsigned long lastSensorRead = 0;
 bool quakeDetected = false;
 unsigned long quakeHoldUntil = 0;
+unsigned long sequenceNumber = 0;
 
 Adafruit_BME280 bme;
 Adafruit_MPU6050 mpu;
@@ -72,6 +82,40 @@ bool bmeFound = false;
 bool mpuFound = false;
 bool displayFound = false;
 bool loraFound = false;
+
+String hmacSha256Hex(const char* key, const char* message) {
+  byte mac[32];
+  mbedtls_md_context_t context;
+
+  mbedtls_md_init(&context);
+  mbedtls_md_setup(
+    &context,
+    mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+    1
+  );
+
+  mbedtls_md_hmac_starts(
+    &context,
+    (const unsigned char*)key,
+    strlen(key)
+  );
+  mbedtls_md_hmac_update(
+    &context,
+    (const unsigned char*)message,
+    strlen(message)
+  );
+  mbedtls_md_hmac_finish(&context, mac);
+  mbedtls_md_free(&context);
+
+  char hex[65];
+
+  for (int i = 0; i < 32; i++) {
+    sprintf(hex + (i * 2), "%02x", mac[i]);
+  }
+
+  hex[64] = '\0';
+  return String(hex);
+}
 
 void setup() {
   Serial.begin(115200);
@@ -257,19 +301,27 @@ void loop() {
   }
 
   if (loraFound) {
-    String payload = "temp=" + String(temperature, 1);
-    payload += ",hum=" + String(humidity, 1);
-    payload += ",pressure=" + String(pressure, 1);
+    sequenceNumber++;
+
+    String payload = "node=" + String(NODE_ID);
+    payload += ",status=" + String(floodDetected ? "FLOOD" : "OK");
+    payload += ",seq=" + String(sequenceNumber);
+    payload += ",t=" + String(temperature, 1);
+    payload += ",h=" + String(humidity, 1);
+    payload += ",p=" + String(pressure, 1);
     payload += ",soil=" + String(soilValue);
-    payload += ",flood=" + String(floodDetected ? "FLOOD" : "OK");
+    payload += ",btn=" + String(buttonPressed ? 1 : 0);
     payload += ",quake=" + String(quakeDetected ? "QUAKE" : "OK");
     payload += ",fire=" + String(fireDetected ? "FIRE" : "OK");
 
+    String signature = hmacSha256Hex(HMAC_KEY, payload.c_str());
+    String signedMessage = payload + "|" + signature;
+
     LoRa.beginPacket();
-    LoRa.print(payload);
+    LoRa.print(signedMessage);
     LoRa.endPacket();
 
     Serial.print("LoRa TX: ");
-    Serial.println(payload);
+    Serial.println(signedMessage);
   }
 }
