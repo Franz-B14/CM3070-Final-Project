@@ -1,15 +1,15 @@
 /*
   sketch_C_responder.ino
-  Stage C8 - actuator pre-movement warning
+  Stage C9 - external responder key configuration
 
   Receives gateway command frames over LoRa and verifies:
     - sender is the gateway
     - HMAC-SHA256 signature
     - monotonically increasing sequence number
 
-  This revision adds a short audible and visual warning before the barrier
-  servo moves. The actuator flashes its LED and sounder for 1.5 seconds before
-  changing position, then returns to the normal WARN, CRITICAL or OFF pattern.
+  This revision removes the gateway HMAC secret from the sketch. The key
+  is supplied by a local responder_secrets.h file that is excluded from Git.
+  A safe example header is kept in the repository for setup instructions.
 */
 
 #include <SPI.h>
@@ -20,6 +20,13 @@
 #include <ESP32Servo.h>
 #include <Preferences.h>
 #include "mbedtls/md.h"
+#include "responder_secrets.h"
+
+#ifndef RESPONDER_GATEWAY_KEY
+#error "Define RESPONDER_GATEWAY_KEY in responder_secrets.h"
+#endif
+
+static const char *KEY_GW = RESPONDER_GATEWAY_KEY;
 
 // ---------------------------------------------------------------------------
 // Local configuration
@@ -50,8 +57,6 @@
 Servo barrierServo;
 Preferences preferences;
 
-static const char *KEY_GW =
-  "REPLACE_WITH_GATEWAY_SECRET_KEY";
 
 // LilyGO T3_V1.6.1 LoRa pins
 #define LORA_SCK    5
