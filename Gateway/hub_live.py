@@ -265,12 +265,27 @@ def responder_state(snapshot):
     if not snapshot:
         return ("OPEN", "OFF", "NONE")
 
+    # The physical barrier reacts to any flood report, even if only one node
+    # currently supports it. Corroboration changes confidence, not whether the
+    # flood response is allowed to start.
     barrier = (
         "CLOSED"
         if "FLOOD" in snapshot
         else "OPEN"
     )
-    alarm = "CRITICAL"
+
+    # Two or more live nodes agreeing on any active hazard raises CRITICAL.
+    # A single observing node, or a hazard held after contact loss, raises WARN.
+    corroborated = any(
+        details.get("corroborated", False)
+        for details in snapshot.values()
+    )
+
+    alarm = (
+        "CRITICAL"
+        if corroborated
+        else "WARN"
+    )
 
     priority = ["FLOOD", "QUAKE", "FIRE"]
     active = [
@@ -284,7 +299,11 @@ def responder_state(snapshot):
     else:
         hazard = active[0]
 
-    return (barrier, alarm, hazard)
+    return (
+        barrier,
+        alarm,
+        hazard
+    )
 
 
 def next_gateway_sequence():
