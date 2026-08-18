@@ -572,11 +572,14 @@ def main():
 
             # One corroboration snapshot is used by the responder, CAP bridge
             # and dashboard so they all see the same hazard picture.
-            current_corroboration = corr.snapshot(
+            current_corroboration = corr.evaluate(
                 live_nodes,
                 current_time
             )
-            corr.prune(current_time)
+            corr.prune(
+                live_nodes,
+                current_time
+            )
 
             # R2 CAP consumes the corroboration snapshot directly. This keeps
             # observing and held nodes separate when certainty is published.

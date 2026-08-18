@@ -27,6 +27,10 @@ class Corroborator:
             for hazard in HAZARDS
         }
 
+        # Records when a node changed from LIVE to LOST. The hazard hold timer
+        # starts here, not at the time of its last sensor message.
+        self.lost_at = {}
+
     def observe(self, node_id, hazards, timestamp=None):
         """
         Record one accepted message from a SenseNode.
@@ -48,6 +52,47 @@ class Corroborator:
             else:
                 self.reports[hazard].pop(node_id, None)
 
+    def update_liveness(self, live_nodes, timestamp=None):
+        """Record the moment a reporting node changes from LIVE to LOST."""
+        timestamp = (
+            time.time()
+            if timestamp is None
+            else timestamp
+        )
+
+        live = set(live_nodes or ())
+        previously_lost = set(self.lost_at)
+
+        # A node that returns clears its old lost timestamp.
+        for node_id in live:
+            self.lost_at.pop(
+                node_id,
+                None
+            )
+
+        # Only nodes that currently have a remembered hazard report matter.
+        reporting_nodes = set()
+
+        for hazard in HAZARDS:
+            reporting_nodes.update(
+                self.reports[hazard]
+            )
+
+        for node_id in reporting_nodes:
+            if (
+                node_id not in live
+                and node_id not in previously_lost
+                and node_id not in self.lost_at
+            ):
+                self.lost_at[node_id] = timestamp
+
+    def held_age(self, node_id, report_time, timestamp):
+        """Return how long a lost node has been in the hold state."""
+        return timestamp - self.lost_at.get(
+            node_id,
+            report_time
+        )
+
     def forget(self, node_id):
         """Remove all stored reports for a node."""
         for hazard in HAZARDS:
@@ -56,13 +101,18 @@ class Corroborator:
                 None
             )
 
+        self.lost_at.pop(
+            node_id,
+            None
+        )
+
     def snapshot(self, live_nodes, timestamp=None):
         """
         Return the current corroboration result.
 
-        The first R1 implementation keeps a report for HAZARD_HOLD_S from the
-        time it was last received. Later revisions will make the hold start when
-        the gateway actually declares the node lost.
+        A live node's most recent report is treated as its current state and
+        does not expire. If the node is LOST, the report is held for hold_s
+        seconds from the moment the gateway declared the node lost.
         """
         timestamp = (
             time.time()
@@ -79,19 +129,16 @@ class Corroborator:
             newest = None
 
             for node_id, report_time in self.reports[hazard].items():
-                age = timestamp - report_time
-
-                # Reports older than the hold period are ignored in this first
-                # version, even if the node is still considered live.
-                if age > self.hold_s:
-                    continue
-
                 if newest is None or report_time > newest:
                     newest = report_time
 
                 if node_id in live:
                     observing.append(node_id)
-                else:
+                elif self.held_age(
+                    node_id,
+                    report_time,
+                    timestamp
+                ) <= self.hold_s:
                     held.append(node_id)
 
             if not observing and not held:
@@ -118,21 +165,47 @@ class Corroborator:
 
         return result
 
-    def prune(self, timestamp=None):
-        """Remove hazard reports that have passed the hold period."""
+    def evaluate(self, live_nodes, timestamp=None):
+        """Record liveness transitions, then return one snapshot."""
         timestamp = (
             time.time()
             if timestamp is None
             else timestamp
         )
 
+        self.update_liveness(
+            live_nodes,
+            timestamp
+        )
+
+        return self.snapshot(
+            live_nodes,
+            timestamp
+        )
+
+    def prune(self, live_nodes, timestamp=None):
+        """Remove reports from nodes lost for longer than the hold period."""
+        timestamp = (
+            time.time()
+            if timestamp is None
+            else timestamp
+        )
+
+        live = set(live_nodes or ())
+
         for hazard in HAZARDS:
-            expired = [
-                node_id
-                for node_id, report_time
-                in self.reports[hazard].items()
-                if timestamp - report_time > self.hold_s
-            ]
+            expired = []
+
+            for node_id, report_time in self.reports[hazard].items():
+                if node_id in live:
+                    continue
+
+                if self.held_age(
+                    node_id,
+                    report_time,
+                    timestamp
+                ) > self.hold_s:
+                    expired.append(node_id)
 
             for node_id in expired:
                 del self.reports[hazard][node_id]
@@ -156,48 +229,44 @@ def command_view(snapshot):
 
 
 def run_self_test():
-    """Exercise the basic corroboration and hold behaviour."""
+    """Exercise corroboration and the corrected lost-node hold clock."""
     corr = Corroborator(hold_s=60.0)
     timestamp = 1000.0
-
+    passed = True
     tests = []
 
-    # One node reports flood.
     corr.observe(
         "n1",
         {"FLOOD"},
         timestamp
     )
-    snap = corr.snapshot(
+
+    snap = corr.evaluate(
         {"n1", "n2", "n3"},
         timestamp
     )
     tests.append((
-        "one node",
+        "initial report",
         snap["FLOOD"]["certainty"],
         "Likely"
     ))
 
-    # A second independent node reports the same flood.
-    timestamp += 5
-    corr.observe(
-        "n2",
-        {"FLOOD"},
-        timestamp
-    )
-    snap = corr.snapshot(
+    # This reproduces the old failure: 70 seconds pass, but n1 is still LIVE.
+    # The flood must remain active because n1 has not sent a clear report.
+    timestamp += 70
+    snap = corr.evaluate(
         {"n1", "n2", "n3"},
         timestamp
     )
     tests.append((
-        "two nodes",
-        snap["FLOOD"]["certainty"],
-        "Observed"
+        "live report retained",
+        "FLOOD" in snap,
+        True
     ))
 
-    # n1 disappears but its recent report remains held.
-    timestamp += 5
-    snap = corr.snapshot(
+    # n1 is now declared LOST. The hold clock starts here.
+    timestamp += 20
+    snap = corr.evaluate(
         {"n2", "n3"},
         timestamp
     )
@@ -207,33 +276,50 @@ def run_self_test():
         ["n1"]
     ))
 
-    # n2 explicitly reports clear.
-    timestamp += 1
-    corr.observe(
-        "n2",
-        set(),
-        timestamp
-    )
-    snap = corr.snapshot(
+    # Still within 60 seconds of the LOST transition.
+    timestamp += 59
+    snap = corr.evaluate(
         {"n2", "n3"},
         timestamp
     )
     tests.append((
-        "explicit clear",
-        snap["FLOOD"]["certainty"],
-        "Unknown"
+        "held for 59 seconds",
+        "FLOOD" in snap,
+        True
     ))
 
-    passed = True
+    # One more second takes the lost duration to 60 exactly, still held.
+    timestamp += 1
+    snap = corr.evaluate(
+        {"n2", "n3"},
+        timestamp
+    )
+    tests.append((
+        "held at 60 seconds",
+        "FLOOD" in snap,
+        True
+    ))
+
+    # After the hold window, it expires.
+    timestamp += 0.1
+    snap = corr.evaluate(
+        {"n2", "n3"},
+        timestamp
+    )
+    tests.append((
+        "expires after hold",
+        "FLOOD" in snap,
+        False
+    ))
 
     for label, actual, expected in tests:
         ok = actual == expected
         passed = passed and ok
 
         print(
-            f"{label:<18} "
-            f"expected={expected!s:<10} "
-            f"actual={actual!s:<10} "
+            f"{label:<23} "
+            f"expected={expected!s:<8} "
+            f"actual={actual!s:<8} "
             f"{'OK' if ok else 'FAIL'}"
         )
 
