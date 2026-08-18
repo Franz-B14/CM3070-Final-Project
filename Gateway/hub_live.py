@@ -15,6 +15,8 @@ import time
 from collections import deque
 from datetime import datetime
 
+from cap_emit import CapEmitter
+
 PORT = "/dev/ttyACM0"
 BAUD = 115200
 STATE_FILE = "/dev/shm/ews_state.json"
@@ -49,6 +51,7 @@ stats = {
     "accepted": 0,
     "rejected": 0,
     "commands_sent": 0,
+    "cap_emitted": 0,
 }
 
 event_log = deque(maxlen=25)
@@ -76,6 +79,7 @@ nodes = {
 }
 
 last_command = ("OPEN", "OFF", "NONE")
+latest_cap = None
 
 
 def now_text():
@@ -313,6 +317,38 @@ def send_command(serial_port, barrier, alarm, hazard):
         print("Command send failed:", error)
 
 
+def active_hazard_map():
+    """Return each live hazard and the nodes currently reporting it."""
+    hazards = {
+        "FLOOD": [],
+        "QUAKE": [],
+        "FIRE": [],
+    }
+
+    for node_id in NODE_ORDER:
+        node = nodes[node_id]
+
+        if not node["live"]:
+            continue
+
+        readings = node["readings"]
+
+        if readings.get("status") == "FLOOD":
+            hazards["FLOOD"].append(node_id)
+
+        if readings.get("quake") == "QUAKE":
+            hazards["QUAKE"].append(node_id)
+
+        if readings.get("fire") == "FIRE":
+            hazards["FIRE"].append(node_id)
+
+    return {
+        hazard: reporting_nodes
+        for hazard, reporting_nodes in hazards.items()
+        if reporting_nodes
+    }
+
+
 def build_state():
     """Build the JSON object used by the dashboard."""
     hazards = sorted(get_active_hazards())
@@ -335,6 +371,7 @@ def build_state():
         "barrier": last_command[0],
         "barrier_commanded": last_command[0],
         "barrier_confirmed": None,
+        "cap": latest_cap,
         "updated": now_text(),
         "node_order": NODE_ORDER,
         "nodes": nodes,
@@ -377,7 +414,7 @@ def print_node_summary(node_id):
 
 
 def main():
-    global last_command
+    global last_command, latest_cap
 
     last_command_time = 0.0
     contact_warned = False
@@ -392,7 +429,10 @@ def main():
     print("Listening for:", ", ".join(NODE_ORDER))
     print("Dashboard state:", STATE_FILE)
     print("Responder commands enabled")
+    print("CAP alert emission enabled")
     print("Press Ctrl+C to stop\n")
+
+    emitter = CapEmitter()
 
     # Start by telling the responder the expected safe state.
     send_command(ser, *last_command)
@@ -492,6 +532,34 @@ def main():
                 for node_id in NODE_ORDER
                 if nodes[node_id]["live"]
             ]
+
+            # CAP emission uses the current live hazard map. This first version
+            # predates the later corroboration/hold logic.
+            hazard_map = active_hazard_map()
+
+            emitted = emitter.step(
+                bool(live_nodes),
+                hazard_map,
+                current_time
+            )
+
+            if emitted:
+                stats["cap_emitted"] += 1
+                latest_cap = emitted
+
+                add_log(
+                    "clear" if emitted["msg_type"] == "Cancel" else "info",
+                    f"CAP {emitted['msg_type']} emitted "
+                    f"({emitted['certainty']})"
+                )
+
+                print(
+                    f"[CAP] {emitted['msg_type']} "
+                    f"{emitted['file']} "
+                    f"certainty={emitted['certainty']}"
+                )
+            else:
+                latest_cap = emitter.latest
 
             desired_command = responder_state()
 
