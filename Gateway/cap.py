@@ -29,27 +29,73 @@ EXPIRY_MINUTES = 60
 
 # Surveyed SenseNode positions used in CAP <area> blocks.
 SITES = {
+    # SenseNode positions used for CAP warning areas.
     "n1": {
+        "class": "sense",
         "desc": "Node 1 - Upper Birkirkara, Valley Road",
         "lat": 35.89672,
         "lon": 14.46239,
         "radius_km": 0.5,
     },
     "n2": {
+        "class": "sense",
         "desc": "Node 2 - Triq il-Wied tal-Imsida",
         "lat": 35.89555,
         "lon": 14.47398,
         "radius_km": 0.5,
     },
     "n3": {
+        "class": "sense",
         "desc": "Node 3 - Msida Creek",
         "lat": 35.89646,
         "lon": 14.49039,
         "radius_km": 0.5,
     },
+
+    # Response/notification positions are indicative for the prototype.
+    "a1": {
+        "class": "respond",
+        "desc": "Barrier - Triq il-Wied tal-Imsida",
+        "lat": 35.89548,
+        "lon": 14.47421,
+        "radius_km": 0.1,
+    },
+    "b1": {
+        "class": "notify",
+        "desc": "Beacon - Triq il-Wied tal-Imsida",
+        "lat": 35.89566,
+        "lon": 14.47380,
+        "radius_km": 0.1,
+    },
+    "b2": {
+        "class": "notify",
+        "desc": "Community display - Msida Creek",
+        "lat": 35.89638,
+        "lon": 14.49058,
+        "radius_km": 0.1,
+    },
+
+    # Final gateway siting is still open. The coordinate keeps the schematic
+    # readable but must not be described as a surveyed installation point.
+    "gw": {
+        "class": "gateway",
+        "desc": "Gateway - [SITE TBC]",
+        "lat": 35.89600,
+        "lon": 14.47800,
+        "radius_km": 0.0,
+    },
 }
 
 FALLBACK_AREA_DESC = "Monitored area (node position not configured)"
+
+
+def sites_of_class(site_class):
+    """Return the configured devices belonging to one site class."""
+    return {
+        site_id: site
+        for site_id, site in SITES.items()
+        if site.get("class") == site_class
+    }
 
 
 HAZARD_PROFILE = {

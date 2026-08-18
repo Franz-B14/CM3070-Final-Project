@@ -410,6 +410,10 @@ PAGE = """<!doctype html>
       height: 11px;
     }
 
+    .map-key .map-device::before {
+      background: #b26a00;
+    }
+
     .map-note {
       margin-top: 5px;
       color: #666;
@@ -603,7 +607,7 @@ PAGE = """<!doctype html>
 
     <div class="map-box">
       <svg id="corridorMap"
-           viewBox="0 0 960 210"
+           viewBox="0 0 960 272"
            preserveAspectRatio="xMidYMid meet"></svg>
     </div>
 
@@ -612,11 +616,13 @@ PAGE = """<!doctype html>
       <span class="map-hazard">SenseNode hazard</span>
       <span class="map-lost">No contact</span>
       <span class="map-held">Silent, hazard held</span>
+      <span class="map-device">Responder / gateway</span>
     </div>
 
     <div class="map-note">
       SenseNode positions are plotted from the same site coordinates used by
-      CAP alert areas. This is an offline schematic, not a street map.
+      CAP alert areas. Responder positions are indicative and the gateway site is
+      still TBC. This is an offline schematic, not a street map.
     </div>
   </div>
 
@@ -812,21 +818,23 @@ function drawCorridorMap(sites) {
   svg.innerHTML = "";
   siteMarkers = {};
 
-  var ids = Object.keys(sites).filter(function(id) {
-    return sites[id].cls === "sense";
-  });
+  var ids = Object.keys(sites);
 
   if (ids.length === 0) {
     return;
   }
 
+  var senseIds = ids.filter(function(id) {
+    return sites[id].cls === "sense";
+  });
+
   // West to east is approximately upstream Birkirkara to downstream Msida.
-  ids.sort(function(a, b) {
+  senseIds.sort(function(a, b) {
     return sites[a].lon - sites[b].lon;
   });
 
   var width = 960;
-  var height = 210;
+  var height = 272;
   var padding = 100;
   var middleY = 105;
 
@@ -865,15 +873,15 @@ function drawCorridorMap(sites) {
   }
 
   // Valley axis through the three SenseNodes.
-  if (ids.length > 1) {
+  if (senseIds.length > 1) {
     var path = "M " +
-      x(sites[ids[0]]) + " " +
-      y(sites[ids[0]]);
+      x(sites[senseIds[0]]) + " " +
+      y(sites[senseIds[0]]);
 
-    for (var index = 1; index < ids.length; index++) {
+    for (var index = 1; index < senseIds.length; index++) {
       path += " L " +
-        x(sites[ids[index]]) + " " +
-        y(sites[ids[index]]);
+        x(sites[senseIds[index]]) + " " +
+        y(sites[senseIds[index]]);
     }
 
     svg.appendChild(
@@ -913,9 +921,9 @@ function drawCorridorMap(sites) {
   );
 
   // Show measured spacing between consecutive nodes.
-  for (var gap = 0; gap < ids.length - 1; gap++) {
-    var first = sites[ids[gap]];
-    var second = sites[ids[gap + 1]];
+  for (var gap = 0; gap < senseIds.length - 1; gap++) {
+    var first = sites[senseIds[gap]];
+    var second = sites[senseIds[gap + 1]];
     var metres = distanceMetres(first, second);
 
     svg.appendChild(
@@ -932,18 +940,49 @@ function drawCorridorMap(sites) {
     );
   }
 
+  var lowerRows = {};
+
   ids.forEach(function(id) {
     var site = sites[id];
     var px = x(site);
-    var py = y(site);
+    var actualY = y(site);
+    var markerY = actualY;
+
+    if (site.cls !== "sense") {
+      // Responder/gateway points sit close to sense nodes at this scale.
+      // Give them lower rows and a leader line back to their true position.
+      var row = 160;
+
+      Object.keys(lowerRows).forEach(function(otherId) {
+        if (Math.abs(lowerRows[otherId] - px) < 90) {
+          row = 210;
+        }
+      });
+
+      lowerRows[id] = px;
+      markerY = row;
+
+      svg.appendChild(
+        svgElement(
+          "line",
+          {
+            x1: px,
+            y1: actualY,
+            x2: px,
+            y2: markerY - 8,
+            class: "tick"
+          }
+        )
+      );
+    }
 
     var circle = svgElement(
       "circle",
       {
         cx: px,
-        cy: py,
-        r: 9,
-        fill: "#777",
+        cy: markerY,
+        r: site.cls === "sense" ? 9 : 7,
+        fill: site.cls === "sense" ? "#777" : "#b26a00",
         stroke: "#fff",
         "stroke-width": 2
       }
@@ -951,12 +990,22 @@ function drawCorridorMap(sites) {
 
     svg.appendChild(circle);
 
+    var labelY =
+      site.cls === "sense"
+      ? markerY - 20
+      : markerY + 18;
+
+    var placeY =
+      site.cls === "sense"
+      ? markerY + 27
+      : markerY + 31;
+
     svg.appendChild(
       svgElement(
         "text",
         {
           x: px,
-          y: py - 20,
+          y: labelY,
           class: "node-name",
           "text-anchor": "middle"
         },
@@ -969,7 +1018,7 @@ function drawCorridorMap(sites) {
         "text",
         {
           x: px,
-          y: py + 27,
+          y: placeY,
           class: "node-place",
           "text-anchor": "middle"
         },
@@ -977,7 +1026,10 @@ function drawCorridorMap(sites) {
       )
     );
 
-    siteMarkers[id] = circle;
+    siteMarkers[id] = {
+      circle: circle,
+      cls: site.cls
+    };
   });
 
   // 500 m scale bar.
@@ -1043,26 +1095,41 @@ function updateCorridorMap(state) {
   });
 
   Object.keys(siteMarkers).forEach(function(nodeId) {
-    var marker = siteMarkers[nodeId];
+    var markerInfo = siteMarkers[nodeId];
+    var marker = markerInfo.circle;
     var node = nodes[nodeId];
 
-    var fill = "#777";
+    var fill = "#b26a00";
     var stroke = "#fff";
     var strokeWidth = 2;
 
-    if (node && node.live) {
-      var readings = node.readings || {};
-
-      var hazard =
-        readings.status === "FLOOD" ||
-        (readings.quake && readings.quake !== "OK") ||
-        (readings.fire && readings.fire !== "OK");
-
-      fill = hazard ? "#c0392b" : "#16865a";
-    } else if (heldNodes[nodeId]) {
+    if (markerInfo.cls === "sense") {
       fill = "#777";
-      stroke = "#c0392b";
-      strokeWidth = 3;
+
+      if (node && node.live) {
+        var readings = node.readings || {};
+
+        var hazard =
+          readings.status === "FLOOD" ||
+          (readings.quake && readings.quake !== "OK") ||
+          (readings.fire && readings.fire !== "OK");
+
+        fill = hazard ? "#c0392b" : "#16865a";
+      } else if (heldNodes[nodeId]) {
+        fill = "#777";
+        stroke = "#c0392b";
+        strokeWidth = 3;
+      }
+    } else if (markerInfo.cls === "respond") {
+      fill =
+        state.barrier_commanded === "CLOSED"
+        ? "#c0392b"
+        : "#b26a00";
+    } else if (markerInfo.cls === "notify") {
+      fill =
+        state.alarm && state.alarm !== "OFF"
+        ? "#c0392b"
+        : "#b26a00";
     }
 
     marker.setAttribute("fill", fill);
@@ -1309,14 +1376,8 @@ def api_sites():
     sites = {}
 
     for node_id, site in cap.SITES.items():
-        # This first schematic shows the three sensing locations only.
-        site_class = site.get("class", "sense")
-
-        if site_class != "sense":
-            continue
-
         sites[node_id] = {
-            "cls": "sense",
+            "cls": site.get("class", "sense"),
             "desc": site["desc"],
             "lat": site["lat"],
             "lon": site["lon"],
