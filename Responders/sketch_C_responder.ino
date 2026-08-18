@@ -1,16 +1,16 @@
 /*
   sketch_C_responder.ino
-  Stage C6 - hazard-specific warning rhythms
+  Stage C7 - warning severity levels
 
   Receives gateway command frames over LoRa and verifies:
     - sender is the gateway
     - HMAC-SHA256 signature
     - monotonically increasing sequence number
 
-  This revision replaces the generic warning pulse with hazard-specific
-  LED and active-sounder rhythms. FLOOD, QUAKE, FIRE and MULTI can therefore
-  be distinguished without reading the OLED. The stale state keeps a quiet
-  LED-only pattern and an active warning still continues through contact loss.
+  This revision distinguishes WARN from CRITICAL gateway commands.
+  CRITICAL keeps the hazard-specific warning rhythms. WARN uses a quieter,
+  infrequent attention pulse for a single-node or held hazard. This makes
+  responder signalling reflect the gateway's corroboration confidence.
 */
 
 #include <SPI.h>
@@ -109,6 +109,14 @@ struct Step {
 
 static const Step PAT_OFF[] = {
   {false, false, 1000}
+};
+
+// Lower-confidence warning: one short beep, LED remains on briefly, then a
+// long quiet pause. This is intentionally less urgent than CRITICAL.
+static const Step PAT_WARN[] = {
+  {true,  true,  100},
+  {true,  false, 200},
+  {false, false, 2700}
 };
 
 static const Step PAT_FLOOD[] = {
@@ -374,9 +382,24 @@ void setPattern(
 
 
 void updateSignalling() {
+  bool critical =
+    strcmp(
+      cmdAlarm,
+      "CRITICAL"
+    ) == 0;
+
+  bool warning =
+    strcmp(
+      cmdAlarm,
+      "WARN"
+    ) == 0;
+
+  // Stale only becomes its own state when no warning is already active.
+  // A WARN or CRITICAL message continues to be shown through contact loss.
   if (
     isGatewayStale() &&
-    !alarmActive()
+    !critical &&
+    !warning
   ) {
     setPattern(
       PAT_STALE,
@@ -385,7 +408,7 @@ void updateSignalling() {
     return;
   }
 
-  if (alarmActive()) {
+  if (critical) {
     if (
       strcmp(
         cmdHazard,
@@ -423,6 +446,14 @@ void updateSignalling() {
       );
     }
 
+    return;
+  }
+
+  if (warning) {
+    setPattern(
+      PAT_WARN,
+      sizeof(PAT_WARN) / sizeof(Step)
+    );
     return;
   }
 
@@ -540,11 +571,31 @@ void drawBeacon() {
     display.println(cmdHazard);
 
     display.setTextSize(1);
-    display.setCursor(0, 38);
-    display.println(line1);
+    display.setCursor(0, 36);
+
+    if (
+      strcmp(
+        cmdAlarm,
+        "WARN"
+      ) == 0
+    ) {
+      display.println("WARNING - unconfirmed");
+    } else {
+      display.println(line1);
+    }
 
     display.setCursor(0, 50);
-    display.println(line2);
+
+    if (
+      strcmp(
+        cmdAlarm,
+        "WARN"
+      ) == 0
+    ) {
+      display.println(line1);
+    } else {
+      display.println(line2);
+    }
   } else if (isGatewayStale()) {
     display.setTextSize(2);
     display.setCursor(0, 18);
