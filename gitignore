@@ -1,0 +1,19 @@
+# Local secrets
+Responders/responder_secrets.h
+
+# Python runtime/cache files
+__pycache__/
+*.py[cod]
+
+# Gateway runtime state
+gw_seq
+node_keys.txt
+ews_state.json
+
+# Generated CAP output
+*.xml
+
+# Editor/OS files
+.vscode/
+.DS_Store
+Thumbs.db
